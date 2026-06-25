@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/codec",
+    "crates/container",
+    "crates/rivet",
+]
+
+# Pull shiguredo_vpl from upstream `develop`. The multi-adapter
+# session-pinning API (`list_adapters`, `AdapterSelector::DrmRenderNode`,
+# adapter-mandatory `EncoderConfig::new` / `DecoderConfig::new`) merged
+# into develop from `feature/change-multi-adapter-session-support`; we
+# follow develop until upstream tags a release > 2026.1.2. Without this
+# we'd be pinned to adapter 0 for every QSV session.
+[workspace.dependencies.shiguredo_vpl]
+git = "https://github.com/shiguredo/vpl-rs"
+branch = "develop"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/elyerinfox/rivet"
+authors = ["Ely Erin Fox"]
+
+[workspace.dependencies]
+anyhow             = "1"
+thiserror          = "2"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+bytes              = "1"
+mp4                = "0.14"
+matroska-demuxer   = "0.7"
+libloading         = "0.8"
+tempfile           = "3"
+criterion          = { version = "0.5", features = ["html_reports"] }
+nvml-wrapper       = "0.10"
+clap               = { version = "4", features = ["derive"] }
+
+# Member crates (path deps so the workspace builds standalone).
+codec     = { path = "crates/codec" }
+container = { path = "crates/container" }
+
+# Fully optimized release build. Fat LTO across all crates, single
+# codegen unit, abort on panic (drops unwind tables). `strip =
+# "debuginfo"` keeps symbol names so production panics resolve to
+# function names.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+opt-level = 3
+
+# Faster iteration build: release-class binary without the fat-LTO cost.
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16

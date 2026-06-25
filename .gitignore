@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Test corpus is fetched on demand, never committed.
+/test_media
+/test_outputs
+
+# FFmpeg dev libraries are fetched on demand (vendor/ffmpeg/fetch.sh).
+/vendor/ffmpeg/ffmpeg-*-full_build-shared/
+/vendor/ffmpeg/ffmpeg-*-shared/
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
