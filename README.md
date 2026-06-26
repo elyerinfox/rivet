@@ -13,6 +13,9 @@ It is built from clean-room demuxers, muxers, and hardware-codec dispatch —
 **no FFmpeg required** by default (FFmpeg is available as an optional decode
 backend behind a feature flag).
 
+📖 **Detailed docs** live in [`docs/`](docs/) — [CLI reference](docs/cli.md) ·
+[HTTP API reference](docs/api.md). This README is the quick tour.
+
 ## Why "rivet"
 
 It fastens generic transcoding logic into a single, reusable component — a
@@ -198,6 +201,9 @@ use rivet::container::cmaf::CmafVideoMuxer;
 
 ## CLI usage
 
+> **Full reference: [docs/cli.md](docs/cli.md)** — every subcommand, flag, and
+> environment variable. A taste:
+
 ```sh
 # Single MP4 at the source resolution (output defaults to <input>.av1.mp4)
 rivet transcode input.mkv -o output.mp4
@@ -231,6 +237,9 @@ Set `RUST_LOG=debug` for verbose logging. Force an encoder backend with
 `TRANSCODE_ENCODER_BACKEND=nvenc|amf|qsv`.
 
 ## HTTP API (`server` feature)
+
+> **Full reference: [docs/api.md](docs/api.md)** — endpoints, the output-spec
+> query params, the job lifecycle, and the OpenAPI/Swagger/Redoc docs.
 
 For a service deployment — where another application **signals** rivet to
 transcode something — build with the `server` feature and run `rivet serve`. It
