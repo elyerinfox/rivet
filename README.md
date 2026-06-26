@@ -253,38 +253,6 @@ rivet serve --addr 0.0.0.0:8080
 Interactive docs ship with it: **`/swagger`** (Swagger UI), **`/redoc`** (Redoc),
 and the raw **`/openapi.json`** (OpenAPI 3.0); `/` links to all three.
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET  /v1/health` | liveness + detected GPUs + this build's output capabilities |
-| `POST /v1/probe` | body = media bytes → JSON media info |
-| `POST /v1/transcode` | body = media bytes, spec from query params → `202 {job_id}` (async) |
-| `GET  /v1/jobs/{id}` | job status + per-rung progress + output list |
-| `GET  /v1/jobs/{id}/artifacts/{label}` | download a single-file rung's MP4 |
-| `GET  /v1/jobs/{id}/files/{*path}` | fetch an HLS file (`master.m3u8`, `…/seg-00001.m4s`) |
-| `GET  /openapi.json`, `/swagger`, `/redoc` | OpenAPI 3.0 document + Swagger UI / Redoc |
-
-`/v1/transcode` takes the output spec as query params — `mode` (single|hls),
-`rungs=1280x720,640x360` (or `ladder=true&max_short_side=1080`), `crf`, `speed`,
-`audio`, `color`, `pixel_format`, `max_fps`, `gpu`, `segment_seconds` — mirroring
-the CLI. Pass `?sync=true` to block and get a single-file MP4 back directly.
-
-```sh
-# Signal a transcode: POST the media, poll the job.
-curl -s http://localhost:8080/v1/health
-job=$(curl -s --data-binary @input.mkv \
-      "http://localhost:8080/v1/transcode?mode=single&crf=28" | jq -r .job_id)
-curl -s "http://localhost:8080/v1/jobs/$job"               # status + progress
-curl -so out.mp4 "http://localhost:8080/v1/jobs/$job/artifacts/720p"   # download
-
-# Or synchronously (single-file, single rung):
-curl -s --data-binary @input.mkv "http://localhost:8080/v1/transcode?sync=true" -o out.mp4
-```
-
-The job registry is in-memory and completed single-file artifacts are held in
-RAM, so this is a sidecar/worker, not a public CDN — a production deployment
-would offload outputs to object storage from a `ProgressSink` watching
-`RungStatus::Completed`.
-
 ## GPU scheduling (the rung benefit)
 
 Both HLS and single-file jobs run on a reactive multi-GPU orchestrator
