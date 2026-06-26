@@ -206,7 +206,29 @@ pub struct OutputSpec {
     /// this; the source cadence is otherwise preserved). `None` = source fps.
     pub max_frame_rate: Option<f64>,
     /// Pin hardware encode/decode to this GPU index on multi-GPU hosts.
+    /// Kept in sync with `encode_policy` (`SingleGpu(idx)` ⇒ `gpu_index = idx`).
     pub gpu_index: Option<u32>,
+    /// How to spread encode work across GPUs. See [`EncodePolicy`].
+    pub encode_policy: EncodePolicy,
+}
+
+/// Selects how a job's encode work is distributed across the host's GPUs.
+///
+/// Applies to both the single-file and HLS paths: `AllGpus` runs the multi-GPU
+/// engine (decode once, chunk each rung across every GPU, stitch); `SingleGpu`
+/// constrains the GPU pool to one device and (for single-file) takes the serial
+/// encode path with no chunk overhead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EncodePolicy {
+    /// Use **all** available GPUs (the multi-GPU lease-pool engine). For
+    /// single-file this chunk-encodes each rung across the GPUs and stitches
+    /// the packets; it falls back to single-GPU serial encode when only one
+    /// GPU is present or the frame count is unknown. This is the default.
+    #[default]
+    AllGpus,
+    /// Use a **single** GPU. `None` picks the first available GPU; `Some(i)`
+    /// pins to GPU index `i`. Single-file uses the serial encode path.
+    SingleGpu(Option<u32>),
 }
 
 impl Default for OutputSpec {
@@ -220,6 +242,7 @@ impl Default for OutputSpec {
             rungs: Vec::new(),
             max_frame_rate: None,
             gpu_index: None,
+            encode_policy: EncodePolicy::default(),
         }
     }
 }
@@ -259,9 +282,29 @@ impl OutputSpec {
         self
     }
 
-    /// Pin to a GPU index.
+    /// Pin to a GPU index. Implies `EncodePolicy::SingleGpu(Some(idx))`.
     pub fn with_gpu_index(mut self, idx: u32) -> Self {
         self.gpu_index = Some(idx);
+        self.encode_policy = EncodePolicy::SingleGpu(Some(idx));
+        self
+    }
+
+    /// Select the GPU encode policy: a single (optionally pinned) GPU, or all
+    /// GPUs (the multi-GPU engine).
+    ///
+    /// ```no_run
+    /// # use rivet::spec::{OutputSpec, EncodePolicy, Rung};
+    /// # let rungs: Vec<Rung> = vec![];
+    /// // chunk-encode across every GPU and stitch:
+    /// let _ = OutputSpec::single_file(rungs.clone()).encode_policy(EncodePolicy::AllGpus);
+    /// // serial encode, pinned to GPU 1:
+    /// let _ = OutputSpec::single_file(rungs).encode_policy(EncodePolicy::SingleGpu(Some(1)));
+    /// ```
+    pub fn encode_policy(mut self, policy: EncodePolicy) -> Self {
+        self.encode_policy = policy;
+        if let EncodePolicy::SingleGpu(idx) = policy {
+            self.gpu_index = idx;
+        }
         self
     }
 
@@ -314,6 +357,38 @@ mod tests {
         assert_eq!(s.container, Container::Mp4);
         assert_eq!(s.muxer, Muxer::Mp4File);
         assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn encode_policy_defaults_to_all_gpus() {
+        let s = OutputSpec::single_file(vec![Rung::new(640, 360)]);
+        assert_eq!(s.encode_policy, EncodePolicy::AllGpus);
+        assert_eq!(s.gpu_index, None);
+    }
+
+    #[test]
+    fn encode_policy_single_gpu_syncs_gpu_index() {
+        let s = OutputSpec::single_file(vec![Rung::new(640, 360)])
+            .encode_policy(EncodePolicy::SingleGpu(Some(2)));
+        assert_eq!(s.encode_policy, EncodePolicy::SingleGpu(Some(2)));
+        assert_eq!(s.gpu_index, Some(2));
+    }
+
+    #[test]
+    fn with_gpu_index_implies_single_gpu_policy() {
+        let s = OutputSpec::single_file(vec![Rung::new(640, 360)]).with_gpu_index(1);
+        assert_eq!(s.encode_policy, EncodePolicy::SingleGpu(Some(1)));
+        assert_eq!(s.gpu_index, Some(1));
+    }
+
+    #[test]
+    fn encode_policy_all_gpus_leaves_gpu_index_untouched() {
+        let s = OutputSpec::single_file(vec![Rung::new(640, 360)])
+            .with_gpu_index(3)
+            .encode_policy(EncodePolicy::AllGpus);
+        // AllGpus doesn't clear an explicit pin; it just won't single-pin.
+        assert_eq!(s.encode_policy, EncodePolicy::AllGpus);
+        assert_eq!(s.gpu_index, Some(3));
     }
 
     #[test]

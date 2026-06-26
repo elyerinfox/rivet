@@ -30,7 +30,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 use rivet::progress::{RungProgress, RungStatus};
-use rivet::spec::{AudioPolicy, OutputSpec, Quality, Rung};
+use rivet::spec::{AudioPolicy, EncodePolicy, OutputSpec, Quality, Rung};
 use rivet::{JobOutput, RungArtifact};
 
 #[derive(Parser)]
@@ -102,9 +102,13 @@ enum Command {
         /// Cap the output frame rate.
         #[arg(long)]
         max_fps: Option<f64>,
-        /// Pin hardware encode/decode to this GPU index.
+        /// Pin hardware encode/decode to this GPU index (implies single-GPU).
         #[arg(long)]
         gpu: Option<u32>,
+        /// Encode serially on a single GPU instead of chunk-encoding across all
+        /// GPUs. Without `--gpu N` this picks the first GPU. Default: all GPUs.
+        #[arg(long)]
+        single_gpu: bool,
     },
     /// Inspect an input file without transcoding it.
     Probe {
@@ -147,6 +151,7 @@ fn run() -> Result<()> {
             audio,
             max_fps,
             gpu,
+            single_gpu,
         } => transcode_cmd(TranscodeArgs {
             input,
             output,
@@ -160,6 +165,7 @@ fn run() -> Result<()> {
             audio,
             max_fps,
             gpu,
+            single_gpu,
         }),
         Command::Probe { input, json } => {
             let info = rivet::probe_file(&input)
@@ -187,6 +193,7 @@ struct TranscodeArgs {
     audio: AudioArg,
     max_fps: Option<f64>,
     gpu: Option<u32>,
+    single_gpu: bool,
 }
 
 fn transcode_cmd(args: TranscodeArgs) -> Result<()> {
@@ -219,7 +226,13 @@ fn transcode_cmd(args: TranscodeArgs) -> Result<()> {
     };
     spec.audio = audio;
     spec.max_frame_rate = args.max_fps;
-    spec.gpu_index = args.gpu;
+    spec = if let Some(idx) = args.gpu {
+        spec.encode_policy(EncodePolicy::SingleGpu(Some(idx)))
+    } else if args.single_gpu {
+        spec.encode_policy(EncodePolicy::SingleGpu(None))
+    } else {
+        spec.encode_policy(EncodePolicy::AllGpus)
+    };
 
     // Progress: one carriage-return line per rung update.
     let sink = Arc::new(rivet::fn_sink(|p: RungProgress| {

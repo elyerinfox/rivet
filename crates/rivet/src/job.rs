@@ -35,9 +35,9 @@ use container::AudioInfo;
 
 use crate::cmaf_util::{self, add_audio_sample_with_segment_flush, keyframe_interval_for_segment};
 use crate::decode_pump::{DecodePumpConfig, run_shared_decode_pump_blocking};
-use crate::multigpu::{self, MultiGpuParams, RungManifest};
+use crate::multigpu::{self, MultiGpuParams, RungManifest, RungPackets};
 use crate::progress::{JobEvent, ProgressSink, RungProgress, RungStatus};
-use crate::spec::{AudioPolicy, OutputMode, OutputSpec, Rung};
+use crate::spec::{AudioPolicy, EncodePolicy, OutputMode, OutputSpec, Rung};
 use crate::validate::needs_chroma_downsample;
 
 /// Bounded per-rung frame channel — backpressures the decode pump.
@@ -210,6 +210,35 @@ async fn run_single_file(
     audio: Option<&PreparedAudio>,
     sink: Arc<dyn ProgressSink>,
 ) -> Result<Vec<RungOutput>> {
+    // When the frame count is known and the host has more than one GPU, run the
+    // multi-GPU engine for single-file too: decode once, chunk each rung at
+    // GOP boundaries, encode the chunks across all GPUs (fair lease pool +
+    // helper dispatch + cross-vendor codec invariant), then stitch the packets,
+    // in segment order, into one MP4 per rung. On a single-GPU host (or unknown
+    // frame count) the serial path below is used unchanged — no chunk overhead.
+    let total_input_frames = if header.info.total_frames > 0 {
+        header.info.total_frames
+    } else {
+        (header.info.duration * frame_rate).round().max(0.0) as u64
+    };
+    let gpu_pool = multigpu::gpu_pool_for_policy(spec.encode_policy);
+    if matches!(spec.encode_policy, EncodePolicy::AllGpus)
+        && total_input_frames > 0
+        && gpu_pool.capacity() > 1
+    {
+        return run_single_file_multigpu(
+            input,
+            spec,
+            header,
+            frame_rate,
+            total_input_frames,
+            audio,
+            gpu_pool,
+            sink,
+        )
+        .await;
+    }
+
     let backend_override = encoder_backend_override();
     let base_cfg = EncoderConfig {
         frame_rate,
@@ -270,6 +299,95 @@ async fn run_single_file(
         bail!("all {} rung(s) failed", spec.rungs.len());
     }
     Ok(outputs)
+}
+
+/// Single-file via the multi-GPU engine: chunk each rung across GPUs, then
+/// stitch the packets into one MP4 per rung (no disk round-trip — packets stay
+/// in memory). Chunk length is a 2 s GOP so each chunk is an independently
+/// decodable IDR sequence; the cross-vendor codec invariant keeps every chunk's
+/// `av1C` contract identical so cross-GPU/-vendor stitching is bit-safe.
+#[allow(clippy::too_many_arguments)]
+async fn run_single_file_multigpu(
+    input: Bytes,
+    spec: &OutputSpec,
+    header: &DemuxHeader,
+    frame_rate: f64,
+    total_input_frames: u64,
+    audio: Option<&PreparedAudio>,
+    gpu_pool: Arc<crate::gpu_pool::GpuPool>,
+    sink: Arc<dyn ProgressSink>,
+) -> Result<Vec<RungOutput>> {
+    const CHUNK_SECONDS: f64 = 2.0;
+    let timescale = (frame_rate * 1000.0).round().max(1.0) as u32;
+    let per_frame_ticks = (timescale as f64 / frame_rate.max(1.0)).round().max(1.0) as u32;
+    let keyframe_interval = keyframe_interval_for_segment(CHUNK_SECONDS, frame_rate);
+    let segment_target_ticks = (keyframe_interval as u64) * (per_frame_ticks as u64);
+
+    let params = MultiGpuParams {
+        input,
+        rungs: &spec.rungs,
+        header: header.clone(),
+        source_color_metadata: header.info.color_metadata,
+        source_pixel_format: header.info.pixel_format,
+        needs_downsample: needs_chroma_downsample(header.info.pixel_format),
+        frame_rate,
+        gpu_pool,
+        // Chunk workers collect packets in memory; output_root is unused.
+        output_root: std::env::temp_dir(),
+        timescale,
+        per_frame_ticks,
+        keyframe_interval,
+        segment_target_ticks,
+        total_input_frames,
+    };
+    let rung_packets = multigpu::run_multigpu_single_file(params, Arc::clone(&sink)).await?;
+
+    let mut outputs = Vec::new();
+    for rp in rung_packets.into_iter().flatten() {
+        let label = rp.label.clone();
+        match mux_rung_packets_to_mp4(rp, frame_rate, audio) {
+            Ok(out) => outputs.push(out),
+            Err(e) => tracing::warn!(rung = %label, error = %e, "stitching rung MP4 failed"),
+        }
+    }
+    if outputs.is_empty() {
+        bail!("multi-GPU single-file: no rung produced a stitched MP4");
+    }
+    Ok(outputs)
+}
+
+/// Stitch one rung's ordered AV1 packets (+ optional audio) into an MP4.
+fn mux_rung_packets_to_mp4(
+    rp: RungPackets,
+    frame_rate: f64,
+    audio: Option<&PreparedAudio>,
+) -> Result<RungOutput> {
+    let mut muxer =
+        Av1Mp4Muxer::new(rp.width, rp.height, frame_rate).context("Av1Mp4Muxer::new")?;
+    muxer.set_color_metadata(ColorMetadata::default());
+    if let Some(a) = audio {
+        if let Err(e) = muxer.with_audio(a.info.clone()) {
+            tracing::warn!(rung = %rp.label, "audio rejected ({e}); video-only");
+        } else {
+            for (sample, dur) in &a.samples {
+                muxer.add_audio_sample(sample, 0, *dur).context("add_audio_sample")?;
+            }
+        }
+    }
+    let frames = rp.packets.len() as u64;
+    for pkt in rp.packets {
+        muxer.add_packet(pkt).context("add_packet")?;
+    }
+    let bytes = muxer.finalize().context("finalize")?.to_vec();
+    let nbytes = bytes.len() as u64;
+    Ok(RungOutput {
+        label: rp.label,
+        width: rp.width,
+        height: rp.height,
+        frames,
+        bytes: nbytes,
+        artifact: RungArtifact::File(bytes),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -369,7 +487,7 @@ async fn run_hls(
         (header.info.duration * frame_rate).round().max(0.0) as u64
     };
 
-    let gpu_pool = multigpu::detect_gpu_pool();
+    let gpu_pool = multigpu::gpu_pool_for_policy(spec.encode_policy);
     let params = MultiGpuParams {
         input,
         rungs: &spec.rungs,

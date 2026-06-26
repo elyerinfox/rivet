@@ -515,6 +515,141 @@ fn encode_one_segment(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Single-file chunked encode: workers collect packets (instead of writing CMAF
+// segments) so the orchestrator can stitch them, in segment order, into one MP4.
+// ---------------------------------------------------------------------------
+
+/// One chunk's encoded packets, in encode (= display, no B-frames) order.
+#[derive(Debug)]
+pub struct ChunkPackets {
+    pub segment_idx: usize,
+    pub packets: Vec<encode::EncodedPacket>,
+}
+
+/// Build the per-rung `EncoderConfig` (HDR fold + quality knobs). Shared by the
+/// CMAF and packet workers.
+fn build_enc_config(cfg: &EncoderWorkerConfig) -> EncoderConfig {
+    let is_hdr_source = matches!(
+        cfg.source_color_metadata.transfer,
+        TransferFn::St2084 | TransferFn::AribStdB67
+    );
+    let (color_metadata, pixel_format) = if is_hdr_source {
+        (ColorMetadata::default(), PixelFormat::Yuv420p)
+    } else {
+        (cfg.source_color_metadata, cfg.source_pixel_format)
+    };
+    EncoderConfig {
+        width: cfg.width,
+        height: cfg.height,
+        frame_rate: cfg.frame_rate,
+        quality: cfg.quality,
+        speed_preset: cfg.speed_preset,
+        keyframe_interval: cfg.keyframe_interval,
+        threads: cfg.threads,
+        pixel_format,
+        color_metadata,
+        gpu_index: cfg.gpu_index,
+        gpu_vendor: cfg.gpu_vendor,
+        target: cfg.target,
+        tier: cfg.tier,
+        ..EncoderConfig::default()
+    }
+}
+
+/// Encoder worker that COLLECTS packets per chunk (single-file path). Each
+/// chunk is encoded by a fresh encoder (first frame an IDR); the cross-vendor
+/// codec invariant is enforced on the first packet (mismatch → requeue + exit,
+/// exactly like the CMAF worker). Ordered `ChunkPackets` are pushed to `out`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_chunk_encoder_worker_blocking(
+    cfg: EncoderWorkerConfig,
+    queue: Arc<SegmentChunkQueue>,
+    rt: tokio::runtime::Handle,
+    shared_frames_encoded: Arc<std::sync::atomic::AtomicU64>,
+    progress_tx: mpsc::Sender<u64>,
+    out: Arc<std::sync::Mutex<Vec<ChunkPackets>>>,
+) -> Result<()> {
+    let enc_config = build_enc_config(&cfg);
+    loop {
+        let chunk = match rt.block_on(queue.pop()) {
+            Some(c) => c,
+            None => break,
+        };
+        match encode_chunk_to_packets(&cfg, &enc_config, chunk, &shared_frames_encoded, &progress_tx)?
+        {
+            ChunkOutcome::Encoded(c) => out.lock().unwrap().push(c),
+            ChunkOutcome::RequeuedOnMismatch { chunk, diff } => {
+                tracing::warn!(
+                    rung_idx = cfg.rung_idx,
+                    gpu_vendor = ?cfg.gpu_vendor,
+                    diff = %diff,
+                    "chunk worker: codec invariant mismatch — requeuing chunk and exiting"
+                );
+                let _ = queue.push_front(chunk);
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+enum ChunkOutcome {
+    Encoded(ChunkPackets),
+    RequeuedOnMismatch { chunk: SegmentChunk, diff: String },
+}
+
+fn encode_chunk_to_packets(
+    cfg: &EncoderWorkerConfig,
+    enc_config: &EncoderConfig,
+    chunk: SegmentChunk,
+    shared_frames_encoded: &std::sync::atomic::AtomicU64,
+    progress_tx: &mpsc::Sender<u64>,
+) -> Result<ChunkOutcome> {
+    let mut encoder =
+        encode::select_encoder(enc_config.clone(), None).context("creating encoder for chunk")?;
+    let segment_idx = chunk.segment_idx;
+    let mut packets: Vec<encode::EncodedPacket> = Vec::new();
+    let mut pending: Vec<encode::EncodedPacket> = Vec::new();
+    let mut decided = false;
+
+    for frame in &chunk.frames {
+        encoder.send_frame(frame).context("send_frame in chunk worker")?;
+        while let Some(packet) = encoder.receive_packet().context("receive_packet in chunk worker")? {
+            if !decided {
+                match validate_or_set_rung_invariant(
+                    cfg.rung_idx,
+                    cfg.gpu_vendor,
+                    &cfg.rung_invariant,
+                    &packet.data,
+                )? {
+                    InvariantCheck::Matched | InvariantCheck::SetByThisWorker => decided = true,
+                    InvariantCheck::Mismatched { diff } => {
+                        return Ok(ChunkOutcome::RequeuedOnMismatch { chunk, diff });
+                    }
+                }
+                pending.push(packet);
+                continue;
+            }
+            packets.append(&mut pending);
+            packets.push(packet);
+        }
+        let n = shared_frames_encoded.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        let _ = progress_tx.try_send(n);
+    }
+    if decided {
+        packets.append(&mut pending);
+    }
+    encoder.flush().context("flush in chunk worker")?;
+    while let Some(packet) = encoder
+        .receive_packet()
+        .context("receive_packet after flush in chunk worker")?
+    {
+        packets.push(packet);
+    }
+    Ok(ChunkOutcome::Encoded(ChunkPackets { segment_idx, packets }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
