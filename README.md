@@ -19,96 +19,42 @@ It fastens the generic transcoding logic that grew up inside a video-processing
 microservice into a standalone, reusable component — a library you can embed
 and a CLI you can run.
 
+## Quick start
+
+Library — one file in, one file out:
+
+```rust
+let outcome = rivet::transcode_file("input.mkv", "output.mp4")?;
+println!("{} frames out", outcome.frames_processed);
+```
+
+CLI — same thing:
+
+```sh
+rivet transcode input.mkv -o output.mp4
+```
+
+The deeper knobs (ladders, HLS, progress, GPU selection) are in
+[Library usage](#library-usage) and [CLI usage](#cli-usage) below.
+
 ## What you configure
 
 A job is described by an [`OutputSpec`](crates/rivet/src/spec.rs):
 
-| Dimension      | Type          | Choices |
-|----------------|---------------|---------|
-| **Output mode**| `OutputMode`  | `SingleFile`, `Hls { segment_seconds }` |
-| **Video codec**| `VideoCodec`  | `Av1` (the only implemented codec — see below) |
-| **Audio**      | `AudioPolicy` | `Auto` (passthrough/transcode), `ForceOpus`, `Drop` |
-| **Container**  | `Container`   | `Mp4`, `Cmaf` |
-| **Muxer**      | `Muxer`       | `Mp4File`, `CmafHls` |
-| **Rungs**      | `Vec<Rung>`   | each `Rung` = `width × height` + per-rung `Quality` (crf / speed / target / tier / keyframe interval) |
+| Dimension       | Type                         | Choices |
+|-----------------|------------------------------|---------|
+| **Output mode** | `OutputMode`                 | `SingleFile`, `Hls { segment_seconds }` |
+| **Video codec** | `VideoCodec`                 | `Av1` (the only implemented codec — see [note](#a-note-on-the-output-codec)) |
+| **Audio**       | `AudioPolicy`                | `Auto` (passthrough/transcode), `ForceOpus`, `Drop` |
+| **Container**   | `Container`                  | `Mp4`, `Cmaf` |
+| **Muxer**       | `Muxer`                      | `Mp4File`, `CmafHls` |
+| **Rungs**       | `Vec<Rung>`                  | each `Rung` = `width × height` + per-rung `Quality` (crf / speed / target / tier / keyframe interval) |
+| **GPU policy**  | `EncodePolicy` / `decode_gpu`| all GPUs / single / pinned / vendor-family, plus a decode-pump GPU override — see [GPU scheduling](#gpu-scheduling-the-rung-benefit) |
 
-Progress is reported through a [`ProgressSink`](crates/rivet/src/progress.rs)
-as a uniform [`RungProgress`] (status, percent, frames, segments, bytes) per
-rung — wire it to a closure, a Tokio mpsc channel, or your own implementation.
-
-## Multi-GPU engine (the rung benefit)
-
-HLS jobs run on a reactive multi-GPU orchestrator
-([`multigpu`](crates/rivet/src/multigpu.rs)) that makes the ABR ladder cheap:
-
-- **Decode once.** A single decode pump feeds every rung — a 5-rung ladder
-  decodes the source one time, not five.
-- **Lease pool.** A process-wide [`GpuPool`](crates/rivet/src/gpu_pool.rs)
-  hands out one encoder lease per GPU (concurrent NVENC sessions on one context
-  deadlock — this is the load-bearing invariant), so rungs encode in parallel
-  *across* GPUs.
-- **Helpers.** When a fast rung releases its lease, the helper dispatcher grabs
-  the freed lease and attaches an extra worker to a still-busy rung — segments
-  are the unit of work, so a slow rung finishes sooner.
-- **Cross-vendor safety.** A helper may land on a different GPU vendor (NVENC +
-  QSV on the same rendition); a per-rung AV1 codec invariant guarantees every
-  segment shares the `av1C` contract, and a mismatched helper requeues its
-  chunk and exits without aborting the job.
-
-**Single-file jobs use the same engine.** On a multi-GPU host, each rung is
-chunked at GOP boundaries and the chunks are encoded across all GPUs (lease
-pool + helpers + the same cross-vendor codec invariant), then stitched — in
-segment order, in memory, no disk round-trip — into one MP4 per rung. Because
-the encoder runs constant-quality (CQP/CRF), independent chunks have no
-rate-control discontinuity at the seams; each chunk just starts with an IDR.
-On a single-GPU host (or when the frame count is unknown) it uses the serial
-decode-once path instead, with no chunk overhead. Either way, a host without
-AV1-encode silicon fails fast with a clear error.
-
-### Encode policy
-
-`OutputSpec::encode_policy(..)` (CLI: `--gpu N` / `--single-gpu` /
-`--gpu-family nvidia|amd|intel`) selects how encode work spreads across GPUs:
-
-| Policy | Single-file | HLS |
-|--------|-------------|-----|
-| `EncodePolicy::AllGpus` *(default)* | chunk across all GPUs, stitch | ladder across all GPUs |
-| `EncodePolicy::SingleGpu(None)` | serial on the first GPU | pool constrained to 1 GPU |
-| `EncodePolicy::SingleGpu(Some(i))` | serial, pinned to GPU `i` | pool constrained to GPU `i` |
-| `EncodePolicy::Family(GpuFamily::Nvidia)` | chunk across that vendor's GPUs | ladder across that vendor's GPUs |
-
-```rust
-let spec = OutputSpec::single_file(rungs)
-    .encode_policy(EncodePolicy::Family(GpuFamily::Nvidia)); // all NVIDIA, ignore an iGPU
-```
-
-**The decode pump follows the policy.** A single decode pump feeds every rung
-(decode once), and it is pinned to a GPU from the policy's selected set — so a
-`Family` / `SingleGpu` constraint governs *decode* too, not just encode (the
-old behavior auto-selected the decoder independently, which could decode on the
-wrong vendor). When per-rung pumps are used (more rungs than pool slots) they
-round-robin over the policy's GPU indices. Override it explicitly with
-`OutputSpec::decode_gpu(Some(i))` (CLI `--decode-gpu i`) — e.g. decode on an
-integrated GPU while the discrete GPUs encode:
-
-```rust
-let spec = OutputSpec::single_file(rungs)
-    .encode_policy(EncodePolicy::Family(GpuFamily::Nvidia))
-    .decode_gpu(Some(0)); // decode on GPU 0, encode across the NVIDIA cards
-```
-
-> **Output codec.** AV1 is the only implemented video codec — it is the
-> project's locked, royalty-clean target (AV1 + Opus). `VideoCodec` is an enum
-> so the dimension is selectable and future codecs can be added without an API
-> break. The encode tier is GPU-accelerated (NVENC / AMF / QSV).
-
-## Crates
-
-| Crate       | Responsibility |
-|-------------|----------------|
-| `codec`     | Frame types, pixel formats, GPU detection, decode (NVDEC / QSV / optional FFmpeg), **AV1** encode (NVENC / AMF / QSV), colorspace + HDR→SDR tonemap, audio decode/encode, probe. |
-| `container` | Demuxers (MP4/MOV/MKV/WebM/TS/AVI), AV1 MP4 muxer with audio, fragmented-MP4 (CMAF) writers, HLS playlist generation, bounded-RSS streaming demuxer. |
-| `rivet`     | The configurable job engine (`run_job`), the output `spec`, the `progress` sink, the ABR `ladder` helper, the shared `decode_pump`, plus simple `transcode`/`probe` helpers and the `rivet` CLI. Re-exports `codec` + `container`. |
+Progress is reported through a [`ProgressSink`](crates/rivet/src/progress.rs) as
+a uniform [`RungProgress`](crates/rivet/src/progress.rs) (status, percent,
+frames, segments, bytes) per rung — wire it to a closure, a Tokio mpsc channel,
+or your own implementation.
 
 ## Library usage
 
@@ -117,7 +63,7 @@ let spec = OutputSpec::single_file(rungs)
 rivet = { git = "https://github.com/elyerinfox/rivet" }
 ```
 
-### Simple: one file in, one file out
+### One file in, one file out
 
 ```rust
 let outcome = rivet::transcode_file("input.mkv", "output.mp4")?;
@@ -127,7 +73,7 @@ let info = rivet::probe_file("input.mkv")?;
 println!("{}x{} {}", info.width, info.height, info.video_codec);
 ```
 
-### Configurable: output modes, rungs, and progress
+### A configurable job with progress
 
 ```rust
 use std::sync::Arc;
@@ -157,6 +103,27 @@ For an **async** progress stream, use `channel_sink(tx)` with a
 `tokio::sync::mpsc::Sender<RungProgress>` and `run_job(...).await` from inside a
 runtime. Derive a sensible ladder from the source with
 `rivet::standard_ladder(width, height, max_short_side)`.
+
+### Choosing GPUs
+
+`encode_policy` controls how encode spreads across GPUs; `decode_gpu` overrides
+the decode-pump device. See [GPU scheduling](#gpu-scheduling-the-rung-benefit)
+for what each policy does.
+
+```rust
+use rivet::{OutputSpec, EncodePolicy, GpuFamily};
+
+// All NVIDIA cards (ignore an integrated AMD/Intel GPU), but decode on GPU 0.
+let spec = OutputSpec::single_file(rungs)
+    .encode_policy(EncodePolicy::Family(GpuFamily::Nvidia))
+    .decode_gpu(Some(0));
+
+// Or pin everything to one GPU:
+let spec = OutputSpec::single_file(rungs)
+    .encode_policy(EncodePolicy::SingleGpu(Some(1)));
+```
+
+### Escape hatch
 
 Need finer control than the engine offers? Reach through the re-exported
 component crates:
@@ -188,17 +155,79 @@ rivet transcode input.mkv -o out.mp4 --crf 28 --speed 6 --audio opus
 rivet probe input.mkv [--json]
 ```
 
+GPU selection (mirrors `EncodePolicy` / `decode_gpu`):
+
+```sh
+rivet transcode in.mkv -o out.mp4 --gpu 1            # pin to GPU 1
+rivet transcode in.mkv -o out.mp4 --single-gpu       # first GPU, serial
+rivet transcode in.mkv -o out.mp4 --gpu-family nvidia # all NVIDIA cards
+rivet transcode in.mkv -o out.mp4 --decode-gpu 0     # decode on GPU 0 (encode follows policy)
+```
+
 Set `RUST_LOG=debug` for verbose logging. Force an encoder backend with
 `TRANSCODE_ENCODER_BACKEND=nvenc|amf|qsv`.
+
+## GPU scheduling (the rung benefit)
+
+Both HLS and single-file jobs run on a reactive multi-GPU orchestrator
+([`multigpu`](crates/rivet/src/multigpu.rs)) that makes the ladder cheap:
+
+- **Decode once.** A single decode pump feeds every rung — a 5-rung ladder
+  decodes the source one time, not five.
+- **Lease pool.** A process-wide [`GpuPool`](crates/rivet/src/gpu_pool.rs)
+  hands out one encoder lease per GPU (concurrent NVENC sessions on one context
+  deadlock — this is the load-bearing invariant), so work runs in parallel
+  *across* GPUs.
+- **Helpers.** When a fast unit of work releases its lease, the helper
+  dispatcher grabs the freed lease and attaches an extra worker to a still-busy
+  rung — segments/chunks are the unit of work, so a slow rung finishes sooner.
+- **Cross-vendor safety.** A helper may land on a different GPU vendor (NVENC +
+  QSV on the same rendition); a per-rung AV1 codec invariant guarantees every
+  segment shares the `av1C` contract, and a mismatched helper requeues its
+  chunk and exits without aborting the job.
+
+For **single-file** output, each rung is chunked at GOP boundaries and the
+chunks are encoded across the GPUs, then stitched — in segment order, in memory,
+no disk round-trip — into one MP4 per rung. Because the encoder runs
+constant-quality (CQP/CRF), independent chunks have no rate-control
+discontinuity at the seams; each chunk just starts with an IDR. On a single-GPU
+host (or when the frame count is unknown) it uses the serial decode-once path
+instead, with no chunk overhead. Either way, a host without AV1-encode silicon
+fails fast with a clear error.
+
+### Encode policy
+
+`OutputSpec::encode_policy(..)` selects how encode work spreads across GPUs (set
+it from the library or the CLI — see above):
+
+| Policy | Single-file | HLS |
+|--------|-------------|-----|
+| `EncodePolicy::AllGpus` *(default)* | chunk across all GPUs, stitch | ladder across all GPUs |
+| `EncodePolicy::SingleGpu(None)` | serial on the first GPU | pool constrained to 1 GPU |
+| `EncodePolicy::SingleGpu(Some(i))` | serial, pinned to GPU `i` | pool constrained to GPU `i` |
+| `EncodePolicy::Family(GpuFamily::Nvidia)` | chunk across that vendor's GPUs | ladder across that vendor's GPUs |
+
+The **decode pump follows the policy**: it is pinned to a GPU from the policy's
+selected set (round-robin over those indices for per-rung pumps), so a `Family`
+/ `SingleGpu` constraint governs *decode* too, not just encode. Override it
+independently with `OutputSpec::decode_gpu(Some(i))` — e.g. decode on an
+integrated GPU while the discrete GPUs encode.
+
+### A note on the output codec
+
+AV1 is the only implemented video codec — it is the project's locked,
+royalty-clean target (AV1 + Opus). `VideoCodec` is an enum so the dimension is
+selectable and future codecs can be added without an API break. The encode tier
+is GPU-accelerated (NVENC / AMF / QSV).
 
 ## Compatibility matrix
 
 ### Input — video decode
 
-Default builds decode on the GPU via the built-in NVDEC. The `nvidia` / `amd`
-/ `qsv` features add decoders via the shiguredo wrapper crates, and `ffmpeg`
-adds the software catalogue (incl. ProRes). All decoders plug into the shared
-decode pump (`create_decoder` → `push_sample` → `decode_next`).
+Default builds decode on the GPU via the built-in NVDEC. The `nvidia` / `amd` /
+`qsv` features add decoders via the shiguredo wrapper crates, and `ffmpeg` adds
+the software catalogue (incl. ProRes). All decoders plug into the shared decode
+pump (`create_decoder` → `push_sample` → `decode_next`).
 
 | Codec          | NVDEC built-in | NVDEC `nvidia` | AMF `amd` | QSV `qsv` | FFmpeg `ffmpeg` |
 |----------------|:--------------:|:--------------:|:---------:|:---------:|:---------------:|
@@ -215,13 +244,13 @@ decode pump (`create_decoder` → `push_sample` → `decode_next`).
 - **NVDEC `nvidia`** — `shiguredo_nvcodec`; preferred over built-in for the
   codecs it covers when the feature is on (MPEG-2/4 fall back to built-in).
 - **AMF `amd`** — `shiguredo_amf`, a new AMD decode tier.
-- The `nvidia` / `amd` / `qsv` features are the same Apache-2.0 shiguredo
-  crates as the encoders, so they build on Linux but not on a Windows MSVC
-  host (see the features note below).
+- The `nvidia` / `amd` / `qsv` features are the same Apache-2.0 shiguredo crates
+  as the encoders — they build on Linux but not on a Windows MSVC host (see the
+  [platform note](#optional-features)).
 
-10-bit / HDR sources decode and are tonemapped to 8-bit SDR BT.709 before
-encode (single-output policy). The shiguredo decoder wrappers output 8-bit
-NV12; the built-in NVDEC handles 10-bit/P016.
+10-bit / HDR sources decode and are tonemapped to 8-bit SDR BT.709 before encode
+(single-output policy). The shiguredo decoder wrappers output 8-bit NV12; the
+built-in NVDEC handles 10-bit/P016.
 
 ### Output — video encode
 
@@ -234,29 +263,29 @@ construction (use the `ffmpeg` feature for a software fallback).
 
 ### Containers
 
-| Container   | Demux (in) | Mux (out) |
-|-------------|:----------:|:---------:|
-| MP4 / MOV   | ✅         | ✅ (single-file + CMAF) |
-| MKV / WebM  | ✅         | — |
-| MPEG-TS     | ✅         | — |
-| AVI (+OpenDML >1 GiB) | ✅ | — |
-| CMAF / HLS  | —          | ✅ (segments + master/media playlists) |
+| Container             | Demux (in) | Mux (out) |
+|-----------------------|:----------:|:---------:|
+| MP4 / MOV             | ✅         | ✅ (single-file + CMAF) |
+| MKV / WebM            | ✅         | — |
+| MPEG-TS               | ✅         | — |
+| AVI (+OpenDML >1 GiB) | ✅         | — |
+| CMAF / HLS            | —          | ✅ (segments + master/media playlists) |
 
 ### Audio
 
-| Codec        | Passthrough | Transcode → Opus |
-|--------------|:-----------:|:----------------:|
-| AAC-LC       | ✅          | — |
-| Opus         | ✅          | (kept as-is)     |
-| AC-3         | ✅          | — |
-| E-AC-3       | ✅          | — |
-| MP3          | —           | ✅ |
-| Vorbis       | —           | ✅ |
+| Codec  | Passthrough | Transcode → Opus |
+|--------|:-----------:|:----------------:|
+| AAC-LC | ✅          | — |
+| Opus   | ✅          | (kept as-is)     |
+| AC-3   | ✅          | — |
+| E-AC-3 | ✅          | — |
+| MP3    | —           | ✅ |
+| Vorbis | —           | ✅ |
 
-`AudioPolicy::Auto` passes through AAC/Opus/AC-3/E-AC-3, transcodes MP3/Vorbis
-to Opus, and drops the rest. `ForceOpus` produces Opus from any decodable
-source; `Drop` yields video-only output. (Multichannel ≥3ch transcode is not
-yet supported and is dropped with a warning.)
+`AudioPolicy::Auto` passes through AAC/Opus/AC-3/E-AC-3, transcodes MP3/Vorbis to
+Opus, and drops the rest. `ForceOpus` produces Opus from any decodable source;
+`Drop` yields video-only output. (Multichannel ≥3ch transcode is not yet
+supported and is dropped with a warning.)
 
 ### Output modes
 
@@ -265,55 +294,58 @@ yet supported and is dropped with a warning.)
 | `single` | One self-contained MP4 per rung (faststart, AV1 + audio). |
 | `hls`    | A CMAF package: per-rung `init.mp4` + `seg-*.m4s`, a shared audio rendition, a media playlist per rung, and a `master.m3u8`. |
 
+## Crates
+
+| Crate       | Responsibility |
+|-------------|----------------|
+| `codec`     | Frame types, pixel formats, GPU detection, decode (NVDEC / QSV / optional FFmpeg), **AV1** encode (NVENC / AMF / QSV), colorspace + HDR→SDR tonemap, audio decode/encode, probe. |
+| `container` | Demuxers (MP4/MOV/MKV/WebM/TS/AVI), AV1 MP4 muxer with audio, fragmented-MP4 (CMAF) writers, HLS playlist generation, bounded-RSS streaming demuxer. |
+| `rivet`     | The configurable job engine (`run_job`), the output `spec`, the `progress` sink, the multi-GPU engine, the ABR `ladder` helper, the shared `decode_pump`, plus simple `transcode`/`probe` helpers and the `rivet` CLI. Re-exports `codec` + `container`. |
+
 ## Building
 
 The default build links native libraries, so it needs a C toolchain plus:
 
 - **nasm** — x86 assembly for the codec stack.
-- **CMake** + a C/C++ compiler — builds libopus (Opus audio encode). Also
-  builds Intel oneVPL when the `qsv` feature is enabled.
+- **CMake** + a C/C++ compiler — builds libopus (Opus audio encode). Also builds
+  Intel oneVPL when the `qsv` feature is enabled.
 
-On Windows the project links the static MSVC CRT (see `.cargo/config.toml`).
-With a modern CMake (4.x) you may need `CMAKE_POLICY_VERSION_MINIMUM=3.5` so
-libopus's older `CMakeLists.txt` configures.
+On Windows the project links the static MSVC CRT (see `.cargo/config.toml`). With
+a modern CMake (4.x) you may need `CMAKE_POLICY_VERSION_MINIMUM=3.5` so libopus's
+older `CMakeLists.txt` configures.
 
 ```sh
 cargo build --release
-cargo run --release -- transcode input.mkv -o output.mp4
+cargo build --release --features qsv
+cargo build --release --features ffmpeg
 ```
 
 ### Optional features
 
 | Feature     | Adds |
 |-------------|------|
-| `nvidia`    | NVENC AV1 hardware **encoder** via [`shiguredo_nvcodec`](https://github.com/shiguredo/nvcodec-rs) (Apache-2.0). Needs libclang at build time; dlopens CUDA at runtime. NVIDIA Ada+. |
-| `amd`       | AMF AV1 hardware **encoder** via [`shiguredo_amf`](https://github.com/shiguredo/amf-rs) (Apache-2.0). Needs libclang at build time; dlopens the AMF runtime. AMD RDNA3+. |
-| `qsv`       | Intel QuickSync / oneVPL hardware decode + encode via [`shiguredo_vpl`] (Apache-2.0; needs CMake + libvpl). Intel Arc / Meteor Lake+. |
+| `nvidia`    | NVENC AV1 hardware **encoder** + NVDEC **decoder** via [`shiguredo_nvcodec`](https://github.com/shiguredo/nvcodec-rs) (Apache-2.0). Needs libclang at build time; dlopens CUDA at runtime. NVIDIA Ada+. |
+| `amd`       | AMF AV1 hardware **encoder** + **decoder** via [`shiguredo_amf`](https://github.com/shiguredo/amf-rs) (Apache-2.0). Needs libclang at build time; dlopens the AMF runtime. AMD RDNA3+. |
+| `qsv`       | Intel QuickSync / oneVPL hardware decode + encode via [`shiguredo_vpl`](https://github.com/shiguredo/vpl-rs) (Apache-2.0; needs CMake + libvpl). Intel Arc / Meteor Lake+. |
 | `ffmpeg`    | libavcodec as the primary decode path (full software catalogue + Vulkan/NVDEC/D3D11/VAAPI hwaccel + AV1 software encode). Needs FFmpeg ≥7.0 dev libs + LLVM/libclang. |
 | `thumbnail` | `rivet::thumbnail::generate_thumbnail` — capture a frame and encode an AVIF still (pulls `ravif`/rav1e). |
 
-> The hardware **encoders** are opt-in features: the NVENC, AMF, and QSV
-> backends are wrappers over the Apache-2.0 `shiguredo_{nvcodec,amf,vpl}`
-> crates (the hand-rolled FFI mirrors were retired). A default build has no
-> hardware encoder — enable `nvidia` / `amd` / `qsv` (or `ffmpeg`) for your
-> target silicon. NVIDIA **decode** (NVDEC) remains built-in.
->
-> ⚠️ Platform note: the three `shiguredo_*` crates bindgen the vendor SDK
-> headers and compile on **Linux** (the production / Docker target) but **not
-> on a Windows MSVC host**. Under the MSVC ABI a non-negative C enum is signed
-> (`int` → `i32`); under the Linux ABI it is `unsigned int` (→ `u32`), which is
-> what the crates expect. So build the `nvidia` / `amd` / `qsv` features on
-> Linux (or in the Docker image); on a Windows dev box use the `ffmpeg` feature
-> or leave them off. (Each feature needs `libclang` at build time —
-> `LIBCLANG_PATH`.)
+The hardware **encoders/decoders** are opt-in: the NVENC, AMF, and QSV backends
+are wrappers over the Apache-2.0 `shiguredo_{nvcodec,amf,vpl}` crates (the
+hand-rolled FFI mirrors were retired). A default build has no hardware encoder —
+enable `nvidia` / `amd` / `qsv` (or `ffmpeg`) for your target silicon. NVIDIA
+**decode** (NVDEC) remains built-in.
 
-```sh
-cargo build --release --features qsv
-cargo build --release --features ffmpeg
-```
+> ⚠️ **Platform note.** The three `shiguredo_*` crates bindgen the vendor SDK
+> headers and compile on **Linux** (the production / Docker target) but **not on
+> a Windows MSVC host**. Under the MSVC ABI a non-negative C enum is signed
+> (`int` → `i32`); under the Linux ABI it is `unsigned int` (→ `u32`), which is
+> what the crates expect. So build the `nvidia` / `amd` / `qsv` features on Linux
+> (or in the Docker image); on a Windows dev box use the `ffmpeg` feature or
+> leave them off. Each feature needs `libclang` at build time (`LIBCLANG_PATH`).
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). The NOTICE file
-credits the Apache-2.0 third-party components used for platform-specific GPU
-codec access (`shiguredo_nvcodec` / `shiguredo_amf` / `shiguredo_vpl`).
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). The NOTICE file credits
+the Apache-2.0 third-party components used for platform-specific GPU codec access
+(`shiguredo_nvcodec` / `shiguredo_amf` / `shiguredo_vpl`).
