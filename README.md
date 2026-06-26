@@ -55,8 +55,31 @@ HLS jobs run on a reactive multi-GPU orchestrator
   segment shares the `av1C` contract, and a mismatched helper requeues its
   chunk and exits without aborting the job.
 
-Single-file jobs use the same decode-once pump with one MP4 muxer per rung. On
-a host without AV1-encode silicon the job fails fast with a clear error.
+**Single-file jobs use the same engine.** On a multi-GPU host, each rung is
+chunked at GOP boundaries and the chunks are encoded across all GPUs (lease
+pool + helpers + the same cross-vendor codec invariant), then stitched — in
+segment order, in memory, no disk round-trip — into one MP4 per rung. Because
+the encoder runs constant-quality (CQP/CRF), independent chunks have no
+rate-control discontinuity at the seams; each chunk just starts with an IDR.
+On a single-GPU host (or when the frame count is unknown) it uses the serial
+decode-once path instead, with no chunk overhead. Either way, a host without
+AV1-encode silicon fails fast with a clear error.
+
+### Encode policy
+
+`OutputSpec::encode_policy(..)` (and the CLI's `--gpu N` / `--single-gpu`)
+selects how encode work spreads across GPUs:
+
+| Policy | Single-file | HLS |
+|--------|-------------|-----|
+| `EncodePolicy::AllGpus` *(default)* | chunk across all GPUs, stitch | ladder across all GPUs |
+| `EncodePolicy::SingleGpu(None)` | serial on the first GPU | pool constrained to 1 GPU |
+| `EncodePolicy::SingleGpu(Some(i))` | serial, pinned to GPU `i` | pool constrained to GPU `i` |
+
+```rust
+let spec = OutputSpec::single_file(rungs)
+    .encode_policy(EncodePolicy::SingleGpu(Some(1))); // pin to GPU 1
+```
 
 > **Output codec.** AV1 is the only implemented video codec — it is the
 > project's locked, royalty-clean target (AV1 + Opus). `VideoCodec` is an enum
