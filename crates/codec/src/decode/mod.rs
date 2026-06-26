@@ -12,9 +12,13 @@
 //! or a codec the local GPU can't decode) hard-fail at
 //! [`create_decoder`]. There is no CPU decode path of any shape.
 
+#[cfg(feature = "amd")]
+pub mod amf_dec;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg;
 pub mod nvdec;
+#[cfg(feature = "nvidia")]
+pub mod nvcodec_dec;
 #[cfg(feature = "qsv")]
 pub mod qsv;
 #[cfg(not(feature = "qsv"))]
@@ -23,6 +27,41 @@ pub mod qsv;
 
 use crate::frame::{StreamInfo, VideoFrame};
 use crate::gpu;
+
+/// Deinterleave an NV12 frame (Y plane + interleaved UV plane, each with its
+/// own row stride) into a tightly-packed `Yuv420p` buffer (Y, then U, then V).
+/// Shared by the `shiguredo_nvcodec` / `shiguredo_amf` decoder wrappers.
+#[cfg(any(feature = "nvidia", feature = "amd"))]
+pub(crate) fn nv12_planes_to_yuv420p(
+    y: &[u8],
+    y_stride: usize,
+    uv: &[u8],
+    uv_stride: usize,
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
+    let cw = width / 2;
+    let ch = height / 2;
+    let mut out = Vec::with_capacity(width * height + 2 * cw * ch);
+    for row in 0..height {
+        let off = row * y_stride;
+        out.extend_from_slice(&y[off..off + width]);
+    }
+    // U then V, deinterleaved from the UV plane.
+    let mut u_plane = Vec::with_capacity(cw * ch);
+    let mut v_plane = Vec::with_capacity(cw * ch);
+    for row in 0..ch {
+        let off = row * uv_stride;
+        let r = &uv[off..off + cw * 2];
+        for c in 0..cw {
+            u_plane.push(r[2 * c]);
+            v_plane.push(r[2 * c + 1]);
+        }
+    }
+    out.extend_from_slice(&u_plane);
+    out.extend_from_slice(&v_plane);
+    out
+}
 use anyhow::{Result, bail};
 
 pub trait Decoder: Send {
@@ -175,6 +214,20 @@ pub fn create_decoder_on(
         && nvdec_supports(&codec_lower)
         && !nvdec_disabled_for(&codec_lower)
     {
+        // When the `nvidia` feature is on, prefer the shiguredo_nvcodec NVDEC
+        // wrapper for the codecs it handles; fall through to the built-in NVDEC
+        // for MPEG-2 / MPEG-4 (which shiguredo_nvcodec doesn't expose).
+        #[cfg(feature = "nvidia")]
+        if nvcodec_dec::supports(&codec_lower) {
+            tracing::info!(
+                backend = "nvcodec",
+                codec = %codec_lower,
+                gpu_index = dev.index,
+                gpu_name = %dev.name,
+                "NVDEC (shiguredo_nvcodec) decoder engaged"
+            );
+            return Ok(Box::new(nvcodec_dec::NvcodecDecoder::new(info, dev.index)?));
+        }
         tracing::info!(
             backend = "nvdec",
             codec = %codec_lower,
@@ -189,6 +242,29 @@ pub fn create_decoder_on(
             codec_lower, dev.index
         );
         return Ok(nvdec::NvdecDecoder::new(info, dev.index));
+    }
+
+    // AMD / AMF decode (new — `amd` feature only).
+    #[cfg(feature = "amd")]
+    {
+        let amd = match gpu_index {
+            Some(idx) => gpus
+                .iter()
+                .find(|g| matches!(g.vendor, gpu::GpuVendor::Amd) && g.index == idx),
+            None => gpus.iter().find(|g| matches!(g.vendor, gpu::GpuVendor::Amd)),
+        };
+        if let Some(dev) = amd
+            && amf_dec::supports(&codec_lower)
+        {
+            tracing::info!(
+                backend = "amf",
+                codec = %codec_lower,
+                gpu_index = dev.index,
+                gpu_name = %dev.name,
+                "AMF (shiguredo_amf) decoder engaged"
+            );
+            return Ok(Box::new(amf_dec::AmfDecoder::new(info, dev.index)?));
+        }
     }
 
     // Intel / QSV next.
