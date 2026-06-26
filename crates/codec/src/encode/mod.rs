@@ -2,6 +2,10 @@ pub mod amf;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg_enc;
 pub mod nvenc;
+#[cfg(feature = "qsv")]
+pub mod qsv;
+#[cfg(not(feature = "qsv"))]
+#[path = "qsv_stub.rs"]
 pub mod qsv;
 pub mod tuning;
 // rav1e CPU encoder + Vulkan video encoder were deleted 2026-05-08

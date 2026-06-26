@@ -31,6 +31,16 @@ default = []
 #   cargo build --workspace --features codec/ffmpeg
 ffmpeg = ["dep:ffmpeg-next"]
 
+# `qsv`: Intel QuickSync / oneVPL hardware decode + encode via the
+# `shiguredo_vpl` crate. OFF by default because it static-links libvpl
+# through a CMake build (needs CMake + a C/C++ toolchain) and is only
+# useful on Intel Arc / Meteor Lake+ hosts. When disabled, the QSV
+# decode/encode paths compile to stubs that error at construction, and
+# the dispatcher simply doesn't offer an Intel hardware tier.
+#
+#   cargo build --features qsv
+qsv = ["dep:shiguredo_vpl"]
+
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
@@ -76,8 +86,9 @@ ffmpeg-next = { version = "7.1", optional = true, default-features = false, feat
 # libmfx-gen + libva + iHD VA-API driver. Used by the QSV decoder
 # (`decode/qsv.rs`) on Intel Arc / Meteor Lake / Lunar Lake hosts;
 # fallthrough on non-Intel HW (the dispatcher returns "no implementation"
-# which the FallbackDecoder catches).
-shiguredo_vpl.workspace = true
+# which the FallbackDecoder catches). Optional — gated behind the `qsv`
+# feature (OFF by default) so a default build needs no CMake/libvpl.
+shiguredo_vpl = { workspace = true, optional = true }
 
 # NVML (NVIDIA Management Library) wrapper. Used by the Phase 2
 # (2026-05-07) richer worker_load surface to read per-GPU utilisation,

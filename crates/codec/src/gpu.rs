@@ -492,6 +492,7 @@ fn detect_intel() -> Vec<GpuDevice> {
 /// once at first call (`MFXLoad` + enumerate + `MFXUnload` + sysfs
 /// walk are paid once per process). Returns an error if the cache
 /// can't be initialised or if `gpu_index` isn't in it.
+#[cfg(feature = "qsv")]
 pub fn adapter_selector_for_gpu_index(
     gpu_index: u32,
 ) -> anyhow::Result<shiguredo_vpl::AdapterSelector> {
@@ -512,6 +513,9 @@ pub fn adapter_selector_for_gpu_index(
 /// abbreviated form is what `host_pci_address_from_sysfs` returns
 /// after it strips the `0000:` domain prefix. Returns `None` if any
 /// component fails to parse. Hex on all components.
+// Only used by the `qsv`-gated render-node map (and by its own unit
+// tests). Silence the dead-code lint on default (no-qsv) builds.
+#[cfg_attr(not(feature = "qsv"), allow(dead_code))]
 fn parse_bdf(bdf: &str) -> Option<(u32, u32, u32, u32)> {
     let bytes = bdf.as_bytes();
     let colon_count = bytes.iter().filter(|&&b| b == b':').count();
@@ -545,6 +549,7 @@ fn parse_bdf(bdf: &str) -> Option<(u32, u32, u32, u32)> {
 ///    PCI is mapped to `list_adapters()[index]` by ordinal position.
 ///    Both enumeration orders normally follow PCI bus order, so this
 ///    fallback agrees with the primary path on a healthy host.
+#[cfg(feature = "qsv")]
 fn adapter_render_node_map() -> anyhow::Result<&'static std::collections::HashMap<u32, u32>> {
     use std::sync::OnceLock;
     static MAP: OnceLock<std::collections::HashMap<u32, u32>> = OnceLock::new();
@@ -566,7 +571,7 @@ fn adapter_render_node_map() -> anyhow::Result<&'static std::collections::HashMa
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "qsv", target_os = "linux"))]
 fn build_render_node_map() -> std::collections::HashMap<u32, u32> {
     let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let adapters = match shiguredo_vpl::list_adapters() {

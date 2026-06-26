@@ -15,6 +15,10 @@
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg;
 pub mod nvdec;
+#[cfg(feature = "qsv")]
+pub mod qsv;
+#[cfg(not(feature = "qsv"))]
+#[path = "qsv_stub.rs"]
 pub mod qsv;
 
 use crate::frame::{StreamInfo, VideoFrame};
