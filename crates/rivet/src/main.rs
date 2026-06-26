@@ -131,8 +131,8 @@ enum SeamArg {
     /// Chunk a single file across all GPUs for speed (default). NVENC chunks run
     /// VBR — possible mild quality steps at the ~2 s seams.
     Parallel,
-    /// Chunk across GPUs but force constant-QP so seams are quality-flat. On
-    /// NVENC this uses the preset's default QP (the quality target is ignored).
+    /// Chunk across GPUs but force constant-QP so seams are quality-flat. The QP
+    /// is derived from the quality target, so quality still tracks it.
     Constqp,
     /// One encoder for the whole file: seam-free + quality-target-accurate, no
     /// multi-GPU single-file speedup.
@@ -210,8 +210,8 @@ enum Command {
         #[arg(long, value_enum, default_value = "auto")]
         pixel_format: PixelArg,
         /// Multi-GPU single-file chunk seam handling: `parallel` (fastest),
-        /// `constqp` (seam-flat, NVENC ignores the quality target), or `serial`
-        /// (one encoder, seam-free, no multi-GPU single-file speedup).
+        /// `constqp` (seam-flat constant-QP, quality still tracks the target), or
+        /// `serial` (one encoder, seam-free, no multi-GPU single-file speedup).
         #[arg(long = "seam-mode", value_enum, default_value = "parallel")]
         seam_mode: SeamArg,
     },

@@ -16,10 +16,8 @@
 pub mod amf_dec;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg;
-pub mod nvdec;
-pub mod nvidia;
 #[cfg(feature = "nvidia")]
-pub mod nvcodec_dec;
+pub mod nvdec;
 #[cfg(feature = "qsv")]
 pub mod qsv;
 #[cfg(not(feature = "qsv"))]
@@ -84,6 +82,7 @@ pub trait Decoder: Send {
 /// Truthy-string parse for env-var opt-outs. `1` / `true` / `yes` / `on`
 /// / `y` / `t` (case-insensitive) all resolve true; anything else is
 /// false. Mirrors the encode-side helper for symmetry.
+#[cfg(feature = "nvidia")]
 fn env_flag_truthy(name: &str) -> bool {
     match std::env::var(name) {
         Ok(v) => {
@@ -99,6 +98,7 @@ fn env_flag_truthy(name: &str) -> bool {
 /// codec, `DISABLE_NVDEC_H264=1` blocks just one. Used as a debugging
 /// escape hatch when a specific codec/driver combo is misbehaving on
 /// the active host (e.g. Blackwell + 4K H.264 silent-stall).
+#[cfg(feature = "nvidia")]
 fn nvdec_disabled_for(codec_lower: &str) -> bool {
     if env_flag_truthy("DISABLE_NVDEC") {
         return true;
@@ -117,6 +117,7 @@ fn nvdec_disabled_for(codec_lower: &str) -> bool {
 }
 
 /// Codecs the NVDEC streaming dispatch supports.
+#[cfg(feature = "nvidia")]
 fn nvdec_supports(codec_lower: &str) -> bool {
     matches!(
         codec_lower,
@@ -193,6 +194,7 @@ pub fn create_decoder_on(
     // (matching against `g.index`). Otherwise fall back to the first
     // of each vendor — the legacy behaviour for callers that don't
     // care about pinning.
+    #[cfg(feature = "nvidia")]
     let nvidia = match gpu_index {
         Some(idx) => gpus
             .iter()
@@ -210,17 +212,22 @@ pub fn create_decoder_on(
             .find(|g| matches!(g.vendor, gpu::GpuVendor::Intel)),
     };
 
-    // NVIDIA / NVDEC first.
+    // NVIDIA / NVDEC first — our hand-rolled CUVID FFI (`nvidia` feature). One
+    // portable decoder for everything NVDEC handles: H.264/HEVC/AV1/VP8/VP9,
+    // MPEG-2/MPEG-4 Part 2, and 10-bit P016.
+    #[cfg(feature = "nvidia")]
     if let Some(dev) = nvidia
         && nvdec_supports(&codec_lower)
         && !nvdec_disabled_for(&codec_lower)
     {
-        // Both NVDEC backends (shiguredo wrapper + built-in) live behind one
-        // façade that picks per (codec, bit depth): 8-bit modern codecs → the
-        // shiguredo wrapper; MPEG-2 / MPEG-4 Part 2 and 10-bit (P016) → the
-        // built-in NVDEC.
-        tracing::debug!(gpu_index = dev.index, gpu_name = %dev.name, "NVDEC device selected");
-        return nvidia::create(&codec_lower, info, dev.index);
+        tracing::info!(
+            backend = "nvdec",
+            codec = %codec_lower,
+            gpu_index = dev.index,
+            gpu_name = %dev.name,
+            "NVDEC decoder engaged (hand-rolled CUVID FFI)"
+        );
+        return Ok(nvdec::NvdecDecoder::new(info, dev.index));
     }
 
     // AMD / AMF decode (new — `amd` feature only).

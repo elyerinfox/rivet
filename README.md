@@ -320,32 +320,29 @@ is GPU-accelerated (NVENC / AMF / QSV).
 
 ### Input — video decode
 
-Default builds decode on the GPU via the built-in NVDEC. The `nvidia` / `amd` /
-`qsv` features add decoders via the shiguredo wrapper crates, and `ffmpeg` adds
-the software catalogue (incl. ProRes). All decoders plug into the shared decode
-pump (`create_decoder` → `push_sample` → `decode_next`).
+GPU decode is feature-gated — each vendor's tier is an opt-in cargo feature, and
+`ffmpeg` adds the software catalogue (incl. ProRes). All decoders plug into the
+shared decode pump (`create_decoder` → `push_sample` → `decode_next`).
 
-| Codec          | NVDEC built-in | NVDEC `nvidia` | AMF `amd` | QSV `qsv` | FFmpeg `ffmpeg` |
-|----------------|:--------------:|:--------------:|:---------:|:---------:|:---------------:|
-| H.264 / AVC    | ✅             | ✅             | ✅        | ✅        | ✅ |
-| HEVC / H.265   | ✅             | ✅             | ✅        | ✅        | ✅ |
-| VP8            | ✅             | ✅             | —         | —         | ✅ |
-| VP9            | ✅             | ✅             | —         | ✅        | ✅ |
-| AV1            | ✅             | ✅             | ✅        | ✅        | ✅ |
-| MPEG-2         | ✅             | —              | —         | —         | ✅ |
-| MPEG-4 Part 2  | ✅             | —              | —         | —         | ✅ |
-| ProRes         | —              | —              | —         | —         | ✅ |
+| Codec          | NVDEC `nvidia` | AMF `amd` | QSV `qsv` | FFmpeg `ffmpeg` |
+|----------------|:--------------:|:---------:|:---------:|:---------------:|
+| H.264 / AVC    | ✅             | ✅        | ✅        | ✅ |
+| HEVC / H.265   | ✅             | ✅        | ✅        | ✅ |
+| VP8            | ✅             | —         | —         | ✅ |
+| VP9            | ✅             | —         | ✅        | ✅ |
+| AV1            | ✅             | ✅        | ✅        | ✅ |
+| MPEG-2         | ✅             | —         | —         | ✅ |
+| MPEG-4 Part 2  | ✅             | —         | —         | ✅ |
+| ProRes         | —              | —         | —         | ✅ |
 
-- **NVIDIA** — both NVDEC backends sit behind **one façade** that picks per
-  `(codec, bit depth)`: the maintained `shiguredo_nvcodec` wrapper (`nvidia`
-  feature) for **8-bit** H.264/HEVC/AV1/VP8/VP9, and the always-compiled
-  built-in NVDEC for what the wrapper doesn't expose — **MPEG-2**, **MPEG-4
-  Part 2**, and **10-bit** (P016). The columns above reflect which backend
-  serves which codec; callers just ask for "NVDEC".
-- **AMF `amd`** — `shiguredo_amf`, a new AMD decode tier.
-- The `nvidia` / `amd` / `qsv` features are the same Apache-2.0 shiguredo crates
-  as the encoders — they build on Linux but not on a Windows MSVC host (see the
-  [platform note](#optional-features)).
+- **NVDEC `nvidia`** — a single, in-repo **hand-rolled CUVID FFI** decoder
+  (`decode/nvdec.rs`, dlopen, no external crate). One path for everything NVDEC
+  does: H.264/HEVC/AV1/VP8/VP9, MPEG-2, MPEG-4 Part 2, and **10-bit P016**.
+  Because it's our own `dlopen` FFI (not the shiguredo crate), the `nvidia`
+  feature builds on **both Windows MSVC and Linux**.
+- **AMF `amd`** — `shiguredo_amf`; **QSV `qsv`** — `shiguredo_vpl` (both
+  Apache-2.0 wrapper crates that build on Linux but not a Windows MSVC host; see
+  the [platform note](#optional-features)).
 
 What happens to a 10-bit / HDR source is the **`ColorPolicy`'s** call, not a
 fixed rule (the decode pump never tonemaps on its own): the default
@@ -353,11 +350,10 @@ fixed rule (the decode pump never tonemaps on its own): the default
 `Hdr10` / `Hlg` / `Passthrough` keep it **10-bit HDR** through to a 10-bit
 encoder (NVENC / AMF / QSV / `ffmpeg`) — see [Output color & bit
 depth](#output-color--bit-depth). Decoding 10-bit needs a 10-bit-preserving
-decoder: on **NVIDIA** the façade routes 10-bit sources to the built-in NVDEC's
-**P016** path automatically (so 10-bit HEVC Main10 / HDR survives — the 8-bit
-shiguredo wrapper only ever sees 8-bit input), and `ffmpeg` decodes 10-bit too.
-The **AMD/Intel** shiguredo decode wrappers are still 8-bit NV12-only, so 10-bit
-on those hosts needs the `ffmpeg` decode path.
+decoder: the **NVIDIA** NVDEC path decodes 10-bit **P016** natively (so 10-bit
+HEVC Main10 / HDR survives), and `ffmpeg` decodes 10-bit too. The **AMD/Intel**
+shiguredo decode wrappers are still 8-bit NV12-only, so 10-bit on those hosts
+needs the `ffmpeg` decode path.
 
 ### Output — video encode (by vendor)
 

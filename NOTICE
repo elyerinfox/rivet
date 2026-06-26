@@ -12,11 +12,6 @@ This software depends on the following Apache License 2.0 components, used
 codec access. Their copyrights and licenses are retained here per Apache-2.0
 section 4(d):
 
-  * shiguredo_nvcodec — Rust bindings for the NVIDIA Video Codec SDK
-    (NVENC / NVDEC). Copyright Shiguredo Inc. Licensed under Apache-2.0.
-    https://github.com/shiguredo/nvcodec-rs
-    Used by the `nvidia` feature (crates/codec/src/encode/nvenc.rs).
-
   * shiguredo_amf — Rust bindings for AMD AMF (Advanced Media Framework).
     Copyright Shiguredo Inc. Licensed under Apache-2.0.
     https://github.com/shiguredo/amf-rs

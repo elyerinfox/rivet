@@ -74,7 +74,7 @@ chiefly governs **NVENC** (which otherwise runs VBR per chunk):
 | Mode | Seams | Speed | Notes |
 |------|-------|-------|-------|
 | `parallel` *(default)* | possible mild NVENC steps | fastest (all GPUs) | each chunk uses its encoder's normal rate control |
-| `constqp` | flat | fast (all GPUs) | forces constant-QP; on NVENC uses the preset's default QP, so `--crf`/quality target no longer steers NVENC quality |
+| `constqp` | flat | fast (all GPUs) | forces constant-QP; the QP is derived from the quality target, so quality still tracks it |
 | `serial` | none | slower (one GPU) | one encoder for the whole file — seam-free and quality-accurate; HLS still uses every GPU |
 
 (Single-GPU hosts, `--single-gpu`/`--gpu`, and HLS jobs are unaffected — HLS

@@ -3,7 +3,7 @@
 //! Keeps `nvenc::NvencEncoder` a real type so the dispatcher in
 //! `encode/mod.rs` compiles unchanged, but construction always errors —
 //! auto-select then skips the NVIDIA tier. Enable `--features nvidia` to
-//! compile the real `shiguredo_nvcodec`-backed encoder (`nvenc.rs`).
+//! compile the real hand-rolled `nvEncodeAPI` FFI encoder (`nvenc.rs`).
 
 use anyhow::{Result, bail};
 
@@ -16,7 +16,7 @@ impl NvencEncoder {
     pub fn new(_config: EncoderConfig, _gpu_index: u32) -> Result<Self> {
         bail!(
             "NVENC encode support was not compiled in; rebuild with the `nvidia` feature \
-             (shiguredo_nvcodec) to use NVIDIA hardware encode"
+             to use NVIDIA hardware encode"
         )
     }
 }

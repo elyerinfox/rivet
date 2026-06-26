@@ -54,8 +54,8 @@ ffmpeg = ["codec/ffmpeg"]
 # Intel QuickSync / oneVPL hardware decode+encode (needs CMake + libvpl
 # toolchain; only useful on Intel Arc / Meteor Lake+ hosts).
 qsv = ["codec/qsv"]
-# NVENC AV1 encoder via shiguredo_nvcodec (Apache-2.0). Needs libclang at
-# build time; dlopens CUDA at runtime. Useful on NVIDIA Ada+ hosts.
+# NVENC AV1 encode + NVDEC decode via hand-rolled dlopen FFI (no external
+# crate; builds on Windows + Linux). NVENC AV1 needs NVIDIA Ada+.
 nvidia = ["codec/nvidia"]
 # AMF AV1 encoder via shiguredo_amf (Apache-2.0). Needs libclang at build
 # time; dlopens the AMF runtime. Useful on AMD RDNA3+ hosts.

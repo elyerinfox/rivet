@@ -1,6 +1,8 @@
 pub mod audio;
 pub mod codec_strings;
 pub mod colorspace;
+// CUDA init serialization — used only by the hand-rolled NVENC/NVDEC FFI.
+#[cfg(feature = "nvidia")]
 pub(crate) mod cuda_lock;
 pub mod decode;
 pub mod encode;

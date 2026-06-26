@@ -264,8 +264,8 @@ pub enum GpuFamily {
 /// `Family` policies on a multi-GPU host); single-GPU hosts, `SingleGpu`, and
 /// HLS (whose segments are independent by design) are unaffected. AMD (AMF) and
 /// Intel (QSV) chunks are already constant-QP, so their seams are quality-flat
-/// — this chiefly governs **NVENC**, whose `shiguredo_nvcodec` wrapper otherwise
-/// runs VBR per chunk and can leave a mild quality step at the ~2 s boundaries.
+/// — this chiefly governs **NVENC**, which otherwise runs VBR per chunk and can
+/// leave a mild quality step at the ~2 s boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChunkSeamMode {
     /// Default. Chunk across GPUs for throughput; each chunk uses its encoder's
@@ -274,10 +274,10 @@ pub enum ChunkSeamMode {
     #[default]
     Parallel,
     /// Chunk across GPUs but force **constant-QP** so the seams are
-    /// quality-flat. Keeps the multi-GPU speedup. Trade-off: on NVENC the
-    /// wrapper uses the encoder preset's default QP, so the `QualityTarget` knob
-    /// stops steering NVENC quality in this mode (the `SpeedTier`/preset still
-    /// does). AMD/QSV are unchanged (already constant-QP).
+    /// quality-flat, keeping the multi-GPU speedup. The QP is derived from the
+    /// `QualityTarget` (via the per-encoder tuning CQ), so quality still tracks
+    /// the target — the hand-rolled NVENC sets a real const-QP rather than a
+    /// preset default. AMD/QSV are unchanged (already constant-QP).
     ParallelConstQp,
     /// Encode the whole file with **one encoder** — seam-free and
     /// `QualityTarget`-accurate, at the cost of the multi-GPU single-file

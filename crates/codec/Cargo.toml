@@ -50,11 +50,14 @@ ffmpeg = ["dep:ffmpeg-next"]
 #   cargo build --features qsv      (Linux)
 qsv = ["dep:shiguredo_vpl"]
 
-# `nvidia`: NVENC AV1 encoder via `shiguredo_nvcodec` (Apache-2.0). Replaces
-# the hand-rolled nvEncodeAPI FFI. dlopens CUDA at runtime (no build-time
-# CUDA link). NVIDIA Ada+.
-#   cargo build --features nvidia   (Linux; needs LIBCLANG_PATH)
-nvidia = ["dep:shiguredo_nvcodec"]
+# `nvidia`: NVENC AV1 encode + NVDEC decode via our own hand-rolled
+# `nvEncodeAPI` / CUVID FFI (`encode/nvenc.rs`, `decode/nvdec.rs`). dlopens the
+# NVIDIA runtime at load time — no build-time CUDA link, no bindgen, no header,
+# so unlike the shiguredo crates it builds on **both Windows MSVC and Linux**.
+# NVENC AV1 needs Ada+; NVDEC decodes H.264/HEVC/AV1/VP8/VP9/MPEG-2/MPEG-4 +
+# 10-bit P016.
+#   cargo build --features nvidia   (Windows or Linux)
+nvidia = []
 
 # `amd`: AMF AV1 encoder via `shiguredo_amf` (Apache-2.0). Replaces the
 # hand-rolled AMF FFI. dlopens the AMF runtime. AMD RDNA3+.
@@ -110,10 +113,9 @@ ffmpeg-next = { version = "7.1", optional = true, default-features = false, feat
 # feature (OFF by default) so a default build needs no CMake/libvpl.
 shiguredo_vpl = { workspace = true, optional = true }
 
-# NVENC AV1 encoder (Apache-2.0). bindgens the NVIDIA Video Codec SDK
-# headers (needs libclang at build time); dlopens CUDA at runtime. Gated
-# behind the `nvidia` feature.
-shiguredo_nvcodec = { version = "2026.2", optional = true }
+# NVIDIA NVENC/NVDEC are hand-rolled dlopen FFI in-tree (encode/nvenc.rs,
+# decode/nvdec.rs) — no external crate, builds on Windows + Linux. The
+# shiguredo_nvcodec dep was retired (it doesn't compile on Windows MSVC).
 
 # AMF AV1 encoder (Apache-2.0). bindgens the AMD AMF SDK headers (needs
 # libclang at build time); dlopens the AMF runtime. Gated behind `amd`.
