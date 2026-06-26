@@ -12,11 +12,6 @@ This software depends on the following Apache License 2.0 components, used
 codec access. Their copyrights and licenses are retained here per Apache-2.0
 section 4(d):
 
-  * shiguredo_amf — Rust bindings for AMD AMF (Advanced Media Framework).
-    Copyright Shiguredo Inc. Licensed under Apache-2.0.
-    https://github.com/shiguredo/amf-rs
-    Used by the `amd` feature (crates/codec/src/encode/amf.rs).
-
   * shiguredo_vpl — Rust bindings for Intel oneVPL (Video Processing
     Library). Copyright Shiguredo Inc. Licensed under Apache-2.0.
     https://github.com/shiguredo/vpl-rs

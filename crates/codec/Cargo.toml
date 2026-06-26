@@ -59,10 +59,11 @@ qsv = ["dep:shiguredo_vpl"]
 #   cargo build --features nvidia   (Windows or Linux)
 nvidia = []
 
-# `amd`: AMF AV1 encoder via `shiguredo_amf` (Apache-2.0). Replaces the
-# hand-rolled AMF FFI. dlopens the AMF runtime. AMD RDNA3+.
-#   cargo build --features amd      (Linux; needs LIBCLANG_PATH)
-amd = ["dep:shiguredo_amf"]
+# `amd`: AMF AV1 encoder via our own hand-rolled AMF FFI (`encode/amf.rs`).
+# dlopens amfrt64.dll / libamfrt64.so.1 — no build-time link, no bindgen, no
+# header, so it builds on **both Windows MSVC and Linux**. AMD RDNA3+.
+#   cargo build --features amd      (Windows or Linux)
+amd = []
 
 [dependencies]
 anyhow.workspace = true
@@ -117,9 +118,8 @@ shiguredo_vpl = { workspace = true, optional = true }
 # decode/nvdec.rs) — no external crate, builds on Windows + Linux. The
 # shiguredo_nvcodec dep was retired (it doesn't compile on Windows MSVC).
 
-# AMF AV1 encoder (Apache-2.0). bindgens the AMD AMF SDK headers (needs
-# libclang at build time); dlopens the AMF runtime. Gated behind `amd`.
-shiguredo_amf = { version = "2026.3", optional = true }
+# AMD AMF is hand-rolled dlopen FFI in-tree (encode/amf.rs) — no external crate,
+# builds on Windows + Linux. The shiguredo_amf dep was retired (Windows MSVC).
 
 # NVML (NVIDIA Management Library) wrapper. Used by the Phase 2
 # (2026-05-07) richer worker_load surface to read per-GPU utilisation,

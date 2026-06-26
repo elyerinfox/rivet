@@ -1203,21 +1203,12 @@ pub fn supports_av1_encode(device: &GpuDevice) -> bool {
         // isn't among them (verified on an RTX 3090: "2 codec(s), none AV1").
         // So admit every NVIDIA GPU here and let the real query be the gate.
         GpuVendor::Nvidia => true,
-        // AMD: AV1 VCN encode arrived on RDNA3 (Radeon RX 7000 series).
-        // RDNA1/2 (RX 5000/6000) can decode AV1 but have no encode ASIC.
-        // Future-proof for RDNA4 (RX 8000, RX 9000) by matching the
-        // family prefix rather than an exhaustive SKU list.
-        GpuVendor::Amd => {
-            let name = device.name.to_lowercase();
-            name.contains("7600")
-                || name.contains("7700")
-                || name.contains("7800")
-                || name.contains("7900")
-                || name.contains("rdna3")
-                || name.contains("rx 8")
-                || name.contains("rx 9")
-                || name.contains("w7") // Pro W7000 workstation series
-        }
+        // AMD: defer to the real path. AV1 VCN encode is RDNA3+ (RX 7000+), but
+        // rather than a brittle SKU list, `AmfEncoder::new` is authoritative —
+        // AMF `CreateComponent(AMFVideoEncoderVCN_AV1)` fails on a pre-RDNA3 GPU
+        // and we bail cleanly ("RDNA3+ GPU required"). Admit every AMD GPU here
+        // and let that decide (matches the NVIDIA policy above).
+        GpuVendor::Amd => true,
         // Intel: AV1 QSV arrived on Arc (DG2 Alchemist) and Meteor
         // Lake iGPUs and is on every later silicon (Battlemage,
         // Lunar Lake, Arrow Lake). The label set below comes from

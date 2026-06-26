@@ -12,8 +12,6 @@
 //! or a codec the local GPU can't decode) hard-fail at
 //! [`create_decoder`]. There is no CPU decode path of any shape.
 
-#[cfg(feature = "amd")]
-pub mod amf_dec;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg;
 #[cfg(feature = "nvidia")]
@@ -230,28 +228,9 @@ pub fn create_decoder_on(
         return Ok(nvdec::NvdecDecoder::new(info, dev.index));
     }
 
-    // AMD / AMF decode (new — `amd` feature only).
-    #[cfg(feature = "amd")]
-    {
-        let amd = match gpu_index {
-            Some(idx) => gpus
-                .iter()
-                .find(|g| matches!(g.vendor, gpu::GpuVendor::Amd) && g.index == idx),
-            None => gpus.iter().find(|g| matches!(g.vendor, gpu::GpuVendor::Amd)),
-        };
-        if let Some(dev) = amd
-            && amf_dec::supports(&codec_lower)
-        {
-            tracing::info!(
-                backend = "amf",
-                codec = %codec_lower,
-                gpu_index = dev.index,
-                gpu_name = %dev.name,
-                "AMF (shiguredo_amf) decoder engaged"
-            );
-            return Ok(Box::new(amf_dec::AmfDecoder::new(info, dev.index)?));
-        }
-    }
+    // AMD hardware decode is not provided in-tree (the shiguredo_amf decode
+    // wrapper was retired with the rest of shiguredo — no portable hand-rolled
+    // AMF decoder exists). AMD hosts decode via the `ffmpeg` feature.
 
     // Intel / QSV next.
     if let Some(dev) = intel
