@@ -24,7 +24,7 @@ rev = "b826324033c4807cb59dd8361813545f44bc5798"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/elyerinfox/rivet"
 authors = ["Ely Erin Fox"]
 

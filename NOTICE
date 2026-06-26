@@ -1,0 +1,46 @@
+rivet
+Copyright 2026 Ely Erin Fox
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+------------------------------------------------------------------------------
+Third-party components
+------------------------------------------------------------------------------
+
+This software depends on the following Apache License 2.0 components, used
+(behind opt-in cargo features) for platform-specific GPU hardware video
+codec access. Their copyrights and licenses are retained here per Apache-2.0
+section 4(d):
+
+  * shiguredo_nvcodec — Rust bindings for the NVIDIA Video Codec SDK
+    (NVENC / NVDEC). Copyright Shiguredo Inc. Licensed under Apache-2.0.
+    https://github.com/shiguredo/nvcodec-rs
+    Used by the `nvidia` feature (crates/codec/src/encode/nvenc.rs).
+
+  * shiguredo_amf — Rust bindings for AMD AMF (Advanced Media Framework).
+    Copyright Shiguredo Inc. Licensed under Apache-2.0.
+    https://github.com/shiguredo/amf-rs
+    Used by the `amd` feature (crates/codec/src/encode/amf.rs).
+
+  * shiguredo_vpl — Rust bindings for Intel oneVPL (Video Processing
+    Library). Copyright Shiguredo Inc. Licensed under Apache-2.0.
+    https://github.com/shiguredo/vpl-rs
+    Used by the `qsv` feature (crates/codec/src/{decode,encode}/qsv.rs).
+
+These wrapper crates load the respective vendor runtime libraries (NVIDIA
+CUDA / NVENC, AMD AMF, Intel oneVPL/VA-API) dynamically at runtime via
+dlopen; the underlying vendor SDKs are proprietary and are not redistributed
+with this software.
+
+------------------------------------------------------------------------------
+
+This software also uses a number of additional open-source Rust crates from
+the broader ecosystem, distributed under permissive licenses (predominantly
+MIT and/or Apache-2.0; some BSD/ISC). A full machine-readable inventory of
+the dependency tree and its licenses can be produced with `cargo metadata`
+or `cargo about`. Notable ones include: tokio, anyhow, thiserror, tracing,
+bytes, clap, mp4, matroska-demuxer, libloading, tempfile (MIT/Apache-2.0);
+minimp3 (MIT), lewton (MIT/Apache-2.0), audiopus (ISC, binding to libopus
+under the BSD license), rubato (MIT); and, when the `ffmpeg` feature is
+enabled, ffmpeg-next (binding to FFmpeg, which is LGPL-2.1+/GPL-2+ — review
+its obligations before distributing an `ffmpeg`-enabled build).
