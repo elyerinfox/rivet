@@ -15,6 +15,10 @@ pub mod qsv;
 #[cfg(not(feature = "qsv"))]
 #[path = "qsv_stub.rs"]
 pub mod qsv;
+/// Hand-written oneVPL P010 path for 10-bit AV1 (the high-level wrapper has no
+/// P010). Only compiled with the `qsv` feature.
+#[cfg(feature = "qsv")]
+pub mod qsv_p010;
 pub mod tuning;
 // rav1e CPU encoder + Vulkan video encoder were deleted 2026-05-08
 // per the GPU-only encoding directive. Production hosts must have
@@ -206,29 +210,46 @@ pub struct OutputCaps {
     pub hdr: bool,
 }
 
-/// Output capabilities of a specific hardware backend. NVENC (`Yuv420_10bit`)
-/// and AMF (`P010`) do 10-bit AV1, so they can produce HDR without the `ffmpeg`
-/// feature. QSV stays 8-bit: `shiguredo_vpl` doesn't expose a 10-bit/P010 input
-/// surface.
+/// Output capabilities of a specific hardware backend. All three do 10-bit AV1,
+/// so they can produce HDR without the `ffmpeg` feature: NVENC via
+/// `Yuv420_10bit`, AMF via `P010`, and QSV via the in-repo oneVPL P010 path
+/// ([`qsv_p010`]).
 pub fn backend_output_caps(backend: EncoderBackend) -> OutputCaps {
     match backend {
-        EncoderBackend::Nvenc | EncoderBackend::Amf => OutputCaps { max_bit_depth: 10, hdr: true },
-        EncoderBackend::Qsv => OutputCaps { max_bit_depth: 8, hdr: false },
+        EncoderBackend::Nvenc | EncoderBackend::Amf | EncoderBackend::Qsv => {
+            OutputCaps { max_bit_depth: 10, hdr: true }
+        }
     }
 }
 
 /// Output capabilities of **this build** — the union over every compiled
-/// encoder path. 10-bit + HDR comes from NVENC (`nvidia`), AMF (`amd`), or the
-/// `ffmpeg` software/hwaccel encoders; a build with only `qsv` (or no encoder
-/// feature) is 8-bit. Callers (e.g. rivet's `OutputSpec::validate`) use this to
-/// reject a format the build can't produce.
+/// encoder path. 10-bit + HDR comes from NVENC (`nvidia`), AMF (`amd`), QSV
+/// (`qsv`, via the in-repo P010 path), or the `ffmpeg` software/hwaccel
+/// encoders; a build with no encoder feature is 8-bit. Callers (e.g. rivet's
+/// `OutputSpec::validate`) use this to reject a format the build can't produce.
 pub fn build_output_caps() -> OutputCaps {
-    #[cfg(any(feature = "ffmpeg", feature = "nvidia", feature = "amd"))]
+    #[cfg(any(
+        feature = "ffmpeg",
+        feature = "nvidia",
+        feature = "amd",
+        feature = "qsv"
+    ))]
     {
         return OutputCaps { max_bit_depth: 10, hdr: true };
     }
     #[allow(unreachable_code)]
     OutputCaps { max_bit_depth: 8, hdr: false }
+}
+
+/// Construct the QSV encoder, routing 10-bit (`Yuv420p10le` → P010) to the
+/// in-repo oneVPL path ([`qsv_p010`]) and 8-bit to the high-level
+/// `shiguredo_vpl` wrapper. Under `not(qsv)` it just hits the stub.
+fn make_qsv_encoder(config: EncoderConfig, gpu_index: u32) -> Result<Box<dyn Encoder>> {
+    #[cfg(feature = "qsv")]
+    if matches!(config.pixel_format, crate::frame::PixelFormat::Yuv420p10le) {
+        return Ok(Box::new(qsv_p010::QsvP010Encoder::new(config, gpu_index)?));
+    }
+    Ok(Box::new(qsv::QsvEncoder::new(config, gpu_index)?))
 }
 
 /// Create the best available AV1 encoder.
@@ -300,8 +321,7 @@ pub fn select_encoder(
                         .map(|e| Box::new(e) as Box<dyn Encoder>),
                     gpu::GpuVendor::Amd => amf::AmfEncoder::new(config.clone(), dev.index)
                         .map(|e| Box::new(e) as Box<dyn Encoder>),
-                    gpu::GpuVendor::Intel => qsv::QsvEncoder::new(config.clone(), dev.index)
-                        .map(|e| Box::new(e) as Box<dyn Encoder>),
+                    gpu::GpuVendor::Intel => make_qsv_encoder(config.clone(), dev.index),
                 };
                 return match attempt {
                     Ok(enc) => {
@@ -401,14 +421,14 @@ pub fn select_encoder(
 
     if let Some(dev) = pick_vendor_device(&gpus, gpu::GpuVendor::Intel, config.gpu_index) {
         if gpu::supports_av1_encode(dev) {
-            match qsv::QsvEncoder::new(config.clone(), dev.index) {
+            match make_qsv_encoder(config.clone(), dev.index) {
                 Ok(enc) => {
                     tracing::info!(
                         gpu_name = %dev.name,
                         gpu_index = dev.index,
                         "using QSV AV1 hardware encoder"
                     );
-                    return Ok(Box::new(enc));
+                    return Ok(enc);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "QSV init failed; chain exhausted");

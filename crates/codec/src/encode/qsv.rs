@@ -52,16 +52,15 @@ impl QsvEncoder {
         // (target, tier, w, h) to QSV-native knobs.
         let tp = tuning::qsv_av1_params(config.target, config.tier, config.width, config.height);
 
-        // 8-bit only on this backend. 10-bit (P010) is a wrapper-crate gap —
-        // `shiguredo_vpl`'s `FrameFormat` exposes Nv12 / Yuy2 / Bgra, no P010 —
-        // so unlike NVENC (Yuv420_10bit) and AMF (P010), QSV can't do HDR
-        // without the `ffmpeg` feature yet. Fail fast so the dispatcher falls
-        // through to the next encoder tier instead of silently downgrading.
+        // This is the **8-bit** QSV path (`shiguredo_vpl`'s high-level
+        // `FrameFormat` exposes only Nv12 / Yuy2 / Bgra — no P010). 10-bit is
+        // handled by the in-repo oneVPL P010 path (`encode::qsv_p010`); the
+        // dispatcher (`make_qsv_encoder`) routes `Yuv420p10le` there, so this
+        // arm shouldn't see 10-bit — the bail is a defensive guard.
         match config.pixel_format {
             PixelFormat::Yuv420p => {}
             PixelFormat::Yuv420p10le => bail!(
-                "QSV encoder: 10-bit (Yuv420p10le → P010) not exposed by shiguredo_vpl; \
-                 use the nvidia/amd/ffmpeg path for HDR. Falling through to next tier."
+                "QSV 8-bit path got Yuv420p10le; 10-bit should route to qsv_p010 (dispatch bug)"
             ),
             other => bail!("QSV encoder expects Yuv420p / Yuv420p10le, got {other:?}"),
         }
