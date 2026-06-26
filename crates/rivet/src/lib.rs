@@ -39,11 +39,17 @@
 //! use rivet::container::mux::Av1Mp4Muxer;
 //! ```
 
+pub mod cmaf_util;
 pub mod decode_pump;
+pub mod encoder_worker;
+pub mod frame_queue;
+pub mod gpu_pool;
 pub mod job;
 pub mod ladder;
+pub mod multigpu;
 pub mod probe;
 pub mod progress;
+pub mod rung_scaler;
 pub mod spec;
 #[cfg(feature = "thumbnail")]
 pub mod thumbnail;
@@ -56,8 +62,10 @@ pub use codec;
 pub use container;
 
 // Flatten the most common entry points to the crate root.
+pub use gpu_pool::{GpuLease, GpuPool};
 pub use job::{JobOutput, RungArtifact, RungOutput, run_job, run_job_blocking};
 pub use ladder::standard_ladder;
+pub use multigpu::{MultiGpuParams, RungManifest, detect_gpu_pool, run_multigpu_hls};
 pub use probe::{AudioStreamInfo, MediaInfo, probe_bytes, probe_file};
 pub use progress::{JobEvent, ProgressSink, RungProgress, RungStatus, channel_sink, fn_sink};
 pub use spec::{
