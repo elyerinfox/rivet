@@ -47,11 +47,45 @@ When the **Intel Arc** and **AMD RDNA-class** cards arrive, verify:
 - [ ] If a path proves unreliable, the `ffmpeg` decode feature remains the
       fallback for that vendor.
 
-## Other
+## AV1 **encode** — verify on AV1-encode silicon
 
-- [ ] NVENC AV1 encode end-to-end on Ada+ silicon (RTX 4000+) — the dev box is
-      Ampere (no AV1 encode); the NVENC path + the 10-bit P010 path are
-      verified-by-review. The capability query correctly rejects AV1 on the 3090.
-- [ ] AMF / QSV AV1 **encode** end-to-end on RDNA3+ / Arc — verified-by-review.
-- [ ] NVENC resolution / 10-bit caps rejection branches (only the AV1-support
-      gate is hardware-proven on the 3090; the max-dim / 10-bit branches aren't).
+Status: **fully implemented + building** (all three vendors hand-rolled in-tree,
+Windows + Linux: `encode/nvenc.rs`, `encode/amf.rs`, `encode/qsv.rs`; 8-bit NV12
++ 10-bit P010; CQP / VBR / ICQ; ChunkSeamMode constant-QP; HDR signalling).
+**No functional gaps** — the only open items are hardware verification, because
+the dev box (RTX 3090 Ampere) has no AV1-encode silicon and there's no AMD
+RDNA3+ / Intel Arc here. This is the *encode* counterpart of the decode backlog
+above; the same Intel + AMD cards (plus an Ada+ NVIDIA card) cover it.
+
+### NVENC (NVIDIA, Ada+)
+- Capability query is **hardware-proven** on the 3090 (correctly rejects AV1 —
+  "2 codecs, none AV1"). The rest is verified-by-review:
+- [ ] End-to-end AV1 encode on Ada+ (RTX 4000+ / A10G / L4 / Blackwell): correct
+      pixels (decode the output, compare against the source), valid `av1C`.
+- [ ] 10-bit P010 encode path (HDR10 ramp → `ffprobe pix_fmt=yuv420p10le` + the
+      colour primaries/transfer/matrix).
+- [ ] The resolution / 10-bit caps **rejection** branches (only the AV1-support
+      gate is hardware-proven; `WIDTH_MAX`/`HEIGHT_MAX`/`SUPPORT_10BIT_ENCODE`
+      rejections aren't exercised on the 3090).
+
+### AMF (AMD, RDNA3+)
+- `CreateComponent(AMFVideoEncoderVCN_AV1)` self-validates ("RDNA3+ GPU
+  required"); the rest is verified-by-review:
+- [ ] End-to-end AV1 encode on RDNA3+ (RX 7000+): correct pixels, valid bitstream.
+- [ ] 10-bit P010 encode (`Av1ColorBitDepth = 2`, P010 surface).
+- [ ] Confirm `SubmitInput` back-pressure / surface-release path under sustained
+      throughput (the encoder's in-flight tracking is verified-by-review).
+
+### QSV (Intel, Arc / Meteor Lake+)
+- `MFXVideoENCODE_Query` self-validates; the rest is verified-by-review:
+- [ ] End-to-end AV1 encode on Arc / Meteor Lake+: correct pixels, valid bitstream.
+- [ ] 10-bit P010 encode (`BitDepthLuma/Chroma = 10`, `Shift = 1`, P010 FourCC).
+- [ ] ICQ vs CQP rate-control output quality on real silicon.
+
+### Cross-vendor
+- [ ] Multi-GPU single-file chunk stitching across **mixed vendors** (the
+      cross-vendor `av1C` codec invariant is verified-by-review — confirm an
+      NVENC + AMF/QSV mix on one rendition decodes cleanly).
+- [ ] Optional: explicit AMF `GetCaps` / QSV implementation-caps query for full
+      parity with NVENC's `GetEncodeGUIDs` enumeration (currently AMF/QSV rely on
+      construction-time self-validation, which is sufficient but coarser).
