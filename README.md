@@ -104,6 +104,35 @@ For an **async** progress stream, use `channel_sink(tx)` with a
 runtime. Derive a sensible ladder from the source with
 `rivet::standard_ladder(width, height, max_short_side)`.
 
+### Color, bit depth & frame rate
+
+A fully-specified single-file job, picking the codec quality, frame-rate cap,
+color/tonemap policy, and output bit depth per [the table below](#output-color--bit-depth):
+
+```rust
+use rivet::{OutputSpec, Rung, Quality, AudioPolicy, ColorPolicy, PixelDepth, PerceptualTarget};
+
+let spec = OutputSpec::single_file(vec![
+    Rung::new(1920, 1080).with_quality(Quality::crf(28)),
+    Rung::new(1280, 720).with_quality(Quality::target(PerceptualTarget::Standard)),
+])
+.with_audio(AudioPolicy::Auto)
+.with_max_frame_rate(30.0)                  // cap output cadence at 30 fps
+.with_color(ColorPolicy::TonemapToSdr)      // tonemap HDR sources → SDR BT.709 (default)
+.with_pixel_format(PixelDepth::Eight);      // 8-bit 4:2:0 — universal web compatibility
+
+spec.validate()?; // rejects e.g. HDR without 10-bit, or 10-bit on an 8-bit-only build
+```
+
+To keep HDR instead of tonemapping (needs a 10-bit-capable encoder — the
+`ffmpeg` feature):
+
+```rust
+let spec = OutputSpec::single_file(rungs)
+    .with_color(ColorPolicy::Hdr10)         // BT.2020 + PQ, no tonemap
+    .with_pixel_format(PixelDepth::Ten);    // 10-bit
+```
+
 ### Choosing GPUs
 
 `encode_policy` controls how encode spreads across GPUs; `decode_gpu` overrides
@@ -260,6 +289,35 @@ built-in NVDEC handles 10-bit/P016.
 
 GPU-only by default — a host with no AV1-encode silicon fails at encoder
 construction (use the `ffmpeg` feature for a software fallback).
+
+### Output color & bit depth
+
+`OutputSpec::with_color(ColorPolicy)` + `with_pixel_format(PixelDepth)` choose
+the output color and bit depth; the decode pump tonemaps **only** when the
+policy says so (it never decides on its own). `validate()` rejects any
+combination this build can't actually produce:
+
+| `ColorPolicy`  | Tonemap | Output signaling          | Bit depth | Needs |
+|----------------|:-------:|---------------------------|:---------:|-------|
+| `TonemapToSdr` *(default)* | HDR→SDR | BT.709 SDR             | 8-bit     | any encoder |
+| `Passthrough`  | no      | source color verbatim     | source    | 10-bit encoder if source is 10-bit |
+| `Hdr10`        | no      | BT.2020 + PQ (ST 2084)    | 10-bit    | `ffmpeg` feature |
+| `Hlg`          | no      | BT.2020 + ARIB STD-B67    | 10-bit    | `ffmpeg` feature |
+
+`PixelDepth` is `Auto` (follow the policy), `Eight`, or `Ten`. What each
+encoder path can produce:
+
+| Encoder path             | Max bit depth | HDR signaling |
+|--------------------------|:-------------:|:-------------:|
+| NVENC / AMF / QSV (shiguredo wrappers) | 8-bit | — |
+| FFmpeg (`ffmpeg` feature) | 10-bit       | ✅            |
+
+So 10-bit / HDR output requires the `ffmpeg` feature today; on a default
+(hardware-only) build, `validate()` returns a clear error pointing at it. The
+matrix is queryable at runtime via `codec::encode::build_output_caps()`.
+
+For **web compatibility** keep the defaults — `TonemapToSdr` + `Auto` yields
+8-bit SDR BT.709 AV1, which every browser and device that supports AV1 plays.
 
 ### Containers
 
