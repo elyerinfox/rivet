@@ -1193,36 +1193,16 @@ impl Default for GpuUtilizationReader {
 
 pub fn supports_av1_encode(device: &GpuDevice) -> bool {
     match device.vendor {
-        // NVIDIA: AV1 NVENC arrived on Ada Lovelace (RTX 4000) and
-        // Ampere A10G (AWS g5) datacenter, ships on every Blackwell
-        // consumer SKU (RTX 5050+) and Blackwell datacenter (B100/
-        // B200/GB200). Hopper has no NVENC at all (compute-only).
-        GpuVendor::Nvidia => {
-            let name = device.name.to_lowercase();
-            // Ampere datacenter
-            name.contains("a10g")
-                || name.contains("l4")
-                || name.contains("l40")
-                // Ada Lovelace consumer + datacenter
-                || name.contains("4060")
-                || name.contains("4070")
-                || name.contains("4080")
-                || name.contains("4090")
-                || name.contains("ada")
-                // Blackwell consumer (5050 / 5060 / 5070 / 5080 / 5090).
-                // 5060 was missing — the dev-box RTX 5060 was rejected
-                // here and every job fell through to rav1e CPU. Verified
-                // E2E AV1 encode on the 5060 in the same session.
-                || name.contains("5050")
-                || name.contains("5060")
-                || name.contains("5070")
-                || name.contains("5080")
-                || name.contains("5090")
-                // Blackwell datacenter
-                || name.contains("b100")
-                || name.contains("b200")
-                || name.contains("gb200")
-        }
+        // NVIDIA: defer to the **real driver capability query**, not a
+        // board-name list. The substring list this used to carry was brittle —
+        // every new SKU had to be added by hand, and a missed one (e.g. the
+        // RTX 5060 once was) now *hard-fails* the job since there's no CPU
+        // fallback. NVENC AV1 support is authoritatively validated by
+        // `nvEncGetEncodeCaps` / `GetEncodeGUIDs` in `NvencEncoder::new`, which
+        // enumerates the GPU's actual encode codecs and bails cleanly if AV1
+        // isn't among them (verified on an RTX 3090: "2 codec(s), none AV1").
+        // So admit every NVIDIA GPU here and let the real query be the gate.
+        GpuVendor::Nvidia => true,
         // AMD: AV1 VCN encode arrived on RDNA3 (Radeon RX 7000 series).
         // RDNA1/2 (RX 5000/6000) can decode AV1 but have no encode ASIC.
         // Future-proof for RDNA4 (RX 8000, RX 9000) by matching the

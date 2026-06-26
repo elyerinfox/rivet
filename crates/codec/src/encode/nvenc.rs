@@ -136,7 +136,7 @@ const NV_ENC_PRESET_CONFIG_VER: u32 = struct_version(5) | (1u32 << 31); // 12.2 
 // GUID layout: 32-bit Data1 (LE), 16-bit Data2/3 (LE), 8 raw bytes.
 // Values from NVIDIA Video Codec SDK 12.2 headers (vendor/nvidia/nvEncodeAPI.h:49).
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Guid {
     data1: u32,
     data2: u16,
@@ -150,6 +150,19 @@ const NV_ENC_CODEC_AV1_GUID: Guid = Guid {
     data3: 0x4759,
     data4: [0x86, 0x2d, 0x5d, 0x15, 0xcd, 0x16, 0xd2, 0x54],
 };
+
+// `NV_ENC_CAPS_PARAM` (nvEncodeAPI.h) — query one capability at a time.
+// Layout: u32 version + NV_ENC_CAPS enum + reserved[62] = 256 bytes.
+#[repr(C)]
+struct NvEncCapsParam {
+    version: u32,
+    caps_to_query: c_uint,
+    reserved: [u32; 62],
+}
+// NV_ENC_CAPS enum values (stable across SDK versions, nvEncodeAPI.h).
+const NV_ENC_CAPS_WIDTH_MAX: c_uint = 16;
+const NV_ENC_CAPS_HEIGHT_MAX: c_uint = 17;
+const NV_ENC_CAPS_SUPPORT_10BIT_ENCODE: c_uint = 39;
 
 // Preset GUIDs from SDK 13.0 (vendor/nvidia/nvEncodeAPI.h:226-251).
 // SDK 12.2 used different values for P5/P6/P7 — see tuning.rs comment
@@ -811,6 +824,11 @@ const NV_ENCODE_API_FUNCTION_LIST_VER: u32 = struct_version(2);
 type FnNvEncodeAPIGetMaxSupportedVersion = unsafe extern "C" fn(*mut u32) -> c_uint;
 type FnNvEncodeAPICreateInstance = unsafe extern "C" fn(*mut NvEncFunctionList) -> c_uint;
 
+type FnNvEncGetEncodeGUIDCount = unsafe extern "C" fn(*mut c_void, *mut u32) -> c_uint;
+type FnNvEncGetEncodeGUIDs =
+    unsafe extern "C" fn(*mut c_void, *mut Guid, u32, *mut u32) -> c_uint;
+type FnNvEncGetEncodeCaps =
+    unsafe extern "C" fn(*mut c_void, Guid, *mut NvEncCapsParam, *mut c_int) -> c_uint;
 type FnNvEncOpenEncodeSessionEx =
     unsafe extern "C" fn(*mut NvEncOpenEncodeSessionExParams, *mut *mut c_void) -> c_uint;
 type FnNvEncInitializeEncoder =
@@ -1304,6 +1322,24 @@ impl NvencEncoder {
                 FnNvEncGetEncodePresetConfigEx,
                 "GetEncodePresetConfigEx"
             );
+            // Capability-query fns — used to confirm this GPU's NVENC actually
+            // does AV1 (and the requested resolution / bit depth) instead of
+            // guessing from the board name.
+            let fn_get_guid_count: FnNvEncGetEncodeGUIDCount = cast_fn!(
+                fn_list.nv_enc_get_encode_guid_count,
+                FnNvEncGetEncodeGUIDCount,
+                "GetEncodeGUIDCount"
+            );
+            let fn_get_guids: FnNvEncGetEncodeGUIDs = cast_fn!(
+                fn_list.nv_enc_get_encode_guids,
+                FnNvEncGetEncodeGUIDs,
+                "GetEncodeGUIDs"
+            );
+            let fn_get_encode_caps: FnNvEncGetEncodeCaps = cast_fn!(
+                fn_list.nv_enc_get_encode_caps,
+                FnNvEncGetEncodeCaps,
+                "GetEncodeCaps"
+            );
 
             // ─── Open encode session on the CUDA device ─────────
             let mut open_params: NvEncOpenEncodeSessionExParams = std::mem::zeroed();
@@ -1342,6 +1378,82 @@ impl NvencEncoder {
                 height = config.height,
                 "NvEncOpenEncodeSessionEx OK — session handle acquired"
             );
+
+            // ─── Capability validation (real driver query) ──────────
+            // Ask the driver what this GPU's NVENC actually supports instead of
+            // guessing from the board name: enumerate the encode codecs and bail
+            // cleanly if AV1 isn't among them (Ampere consumer / Turing / Pascal),
+            // then check AV1 max resolution + 10-bit against the requested config.
+            let cap_err: Option<String> = {
+                let mut guid_count: u32 = 0;
+                if fn_get_guid_count(encoder, &mut guid_count) != NV_ENC_SUCCESS {
+                    Some(format!("NvEncGetEncodeGUIDCount failed on GPU {gpu_index}"))
+                } else {
+                    let mut guids = vec![
+                        Guid { data1: 0, data2: 0, data3: 0, data4: [0u8; 8] };
+                        guid_count.max(1) as usize
+                    ];
+                    let mut returned: u32 = 0;
+                    if fn_get_guids(encoder, guids.as_mut_ptr(), guid_count, &mut returned)
+                        != NV_ENC_SUCCESS
+                    {
+                        Some(format!("NvEncGetEncodeGUIDs failed on GPU {gpu_index}"))
+                    } else if !guids[..returned as usize]
+                        .iter()
+                        .any(|g| *g == NV_ENC_CODEC_AV1_GUID)
+                    {
+                        Some(format!(
+                            "NVENC on GPU {gpu_index} does not support AV1 encode \
+                             ({returned} codec(s) advertised, none AV1) — needs NVIDIA \
+                             Ada+ or an Ampere datacenter SKU"
+                        ))
+                    } else {
+                        // AV1 supported — validate resolution + 10-bit caps.
+                        let query = |cap: c_uint| -> i32 {
+                            let mut p: NvEncCapsParam = std::mem::zeroed();
+                            p.version = struct_version(1);
+                            p.caps_to_query = cap;
+                            let mut val: c_int = 0;
+                            let rc =
+                                fn_get_encode_caps(encoder, NV_ENC_CODEC_AV1_GUID, &mut p, &mut val);
+                            if rc != NV_ENC_SUCCESS { -1 } else { val }
+                        };
+                        let w_max = query(NV_ENC_CAPS_WIDTH_MAX);
+                        let h_max = query(NV_ENC_CAPS_HEIGHT_MAX);
+                        if w_max > 0
+                            && h_max > 0
+                            && ((config.width as i32) > w_max || (config.height as i32) > h_max)
+                        {
+                            Some(format!(
+                                "NVENC AV1 on GPU {gpu_index} maxes at {w_max}x{h_max}, \
+                                 requested {}x{}",
+                                config.width, config.height
+                            ))
+                        } else if config.pixel_format == PixelFormat::Yuv420p10le
+                            && query(NV_ENC_CAPS_SUPPORT_10BIT_ENCODE) == 0
+                        {
+                            Some(format!(
+                                "NVENC on GPU {gpu_index} does not support 10-bit AV1 encode"
+                            ))
+                        } else {
+                            tracing::info!(
+                                gpu_index,
+                                av1 = true,
+                                w_max,
+                                h_max,
+                                ten_bit = config.pixel_format == PixelFormat::Yuv420p10le,
+                                "NVENC AV1 capability validated"
+                            );
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some(msg) = cap_err {
+                fn_destroy_encoder(encoder);
+                (*fn_cu_ctx_destroy)(cuda_ctx);
+                bail!("{msg}");
+            }
 
             // ─── Build encode config via the tuning adapter ────────
             //
