@@ -344,9 +344,15 @@ pump (`create_decoder` → `push_sample` → `decode_next`).
   as the encoders — they build on Linux but not on a Windows MSVC host (see the
   [platform note](#optional-features)).
 
-10-bit / HDR sources decode and are tonemapped to 8-bit SDR BT.709 before encode
-(single-output policy). The shiguredo decoder wrappers output 8-bit NV12; the
-built-in NVDEC handles 10-bit/P016.
+What happens to a 10-bit / HDR source is now the **`ColorPolicy`'s** call, not a
+fixed rule (the decode pump never tonemaps on its own): the default
+`TonemapToSdr` maps HDR → 8-bit SDR BT.709 for maximum web compatibility, while
+`Hdr10` / `Hlg` / `Passthrough` keep it **10-bit HDR** through to a 10-bit
+encoder (NVENC / AMF / QSV / `ffmpeg`) — see [Output color & bit
+depth](#output-color--bit-depth). Decoding 10-bit needs a 10-bit-preserving
+decoder: the built-in NVDEC outputs P016 and `ffmpeg` outputs 10-bit, whereas
+the shiguredo decode wrappers currently output 8-bit NV12 (they downconvert a
+10-bit source).
 
 ### Output — video encode (by vendor)
 

@@ -51,12 +51,13 @@ curl -s http://localhost:8080/v1/health
   "status": "ok",
   "service": "rivet",
   "gpus": [{ "index": 0, "vendor": "Nvidia", "name": "NVIDIA GeForce RTX 3090" }],
-  "output_caps": { "max_bit_depth": 8, "hdr": false }
+  "output_caps": { "max_bit_depth": 10, "hdr": true }
 }
 ```
 
-`output_caps` reflects what the build can actually encode (8-bit unless the
-`ffmpeg` feature is on) — useful for a client to decide whether to request HDR.
+`output_caps` reflects what the build can actually encode — `max_bit_depth` is
+10 (and `hdr` true) when built with a 10-bit encoder (`nvidia`, `amd`, `qsv`, or
+`ffmpeg`), else 8 — useful for a client to decide whether to request HDR.
 
 ### `POST /v1/probe`
 
