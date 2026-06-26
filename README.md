@@ -232,9 +232,16 @@ it from the library or the CLI — see above):
 | Policy | Single-file | HLS |
 |--------|-------------|-----|
 | `EncodePolicy::AllGpus` *(default)* | chunk across all GPUs, stitch | ladder across all GPUs |
-| `EncodePolicy::SingleGpu(None)` | serial on the first GPU | pool constrained to 1 GPU |
-| `EncodePolicy::SingleGpu(Some(i))` | serial, pinned to GPU `i` | pool constrained to GPU `i` |
+| `EncodePolicy::SingleGpu(None)` | runs on the first GPU | runs on the first GPU |
+| `EncodePolicy::SingleGpu(Some(i))` | runs on GPU `i` | runs on GPU `i` |
 | `EncodePolicy::Family(GpuFamily::Nvidia)` | chunk across that vendor's GPUs | ladder across that vendor's GPUs |
+
+For `SingleGpu` both modes run the same way — sequentially on one GPU — they just
+reach it differently: single-file takes a lean serial path (no GOP chunking,
+nothing to parallelize on one GPU), while HLS always runs the lease-pool
+orchestrator (one lease) because its output is inherently segmented. For
+`AllGpus` / `Family` they genuinely differ: single-file chunks-and-stitches,
+HLS ladders-and-segments across the selected GPUs.
 
 The **decode pump follows the policy**: it is pinned to a GPU from the policy's
 selected set (round-robin over those indices for per-rung pumps), so a `Family`
