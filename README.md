@@ -236,9 +236,26 @@ cargo run --release -- transcode input.mkv -o output.mp4
 
 | Feature     | Adds |
 |-------------|------|
-| `qsv`       | Intel QuickSync / oneVPL hardware decode + encode (off by default; needs CMake + libvpl, useful on Intel Arc / Meteor Lake+). |
+| `nvidia`    | NVENC AV1 hardware **encoder** via [`shiguredo_nvcodec`](https://github.com/shiguredo/nvcodec-rs) (Apache-2.0). Needs libclang at build time; dlopens CUDA at runtime. NVIDIA Ada+. |
+| `amd`       | AMF AV1 hardware **encoder** via [`shiguredo_amf`](https://github.com/shiguredo/amf-rs) (Apache-2.0). Needs libclang at build time; dlopens the AMF runtime. AMD RDNA3+. |
+| `qsv`       | Intel QuickSync / oneVPL hardware decode + encode via [`shiguredo_vpl`] (Apache-2.0; needs CMake + libvpl). Intel Arc / Meteor Lake+. |
 | `ffmpeg`    | libavcodec as the primary decode path (full software catalogue + Vulkan/NVDEC/D3D11/VAAPI hwaccel + AV1 software encode). Needs FFmpeg ≥7.0 dev libs + LLVM/libclang. |
 | `thumbnail` | `rivet::thumbnail::generate_thumbnail` — capture a frame and encode an AVIF still (pulls `ravif`/rav1e). |
+
+> The hardware **encoders** are opt-in features: the NVENC, AMF, and QSV
+> backends are wrappers over the Apache-2.0 `shiguredo_{nvcodec,amf,vpl}`
+> crates (the hand-rolled FFI mirrors were retired). A default build has no
+> hardware encoder — enable `nvidia` / `amd` / `qsv` (or `ffmpeg`) for your
+> target silicon. NVIDIA **decode** (NVDEC) remains built-in.
+>
+> ⚠️ Platform note: the three `shiguredo_*` crates bindgen the vendor SDK
+> headers and compile on **Linux** (the production / Docker target) but **not
+> on a Windows MSVC host**. Under the MSVC ABI a non-negative C enum is signed
+> (`int` → `i32`); under the Linux ABI it is `unsigned int` (→ `u32`), which is
+> what the crates expect. So build the `nvidia` / `amd` / `qsv` features on
+> Linux (or in the Docker image); on a Windows dev box use the `ffmpeg` feature
+> or leave them off. (Each feature needs `libclang` at build time —
+> `LIBCLANG_PATH`.)
 
 ```sh
 cargo build --release --features qsv
@@ -247,4 +264,6 @@ cargo build --release --features ffmpeg
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). The NOTICE file
+credits the Apache-2.0 third-party components used for platform-specific GPU
+codec access (`shiguredo_nvcodec` / `shiguredo_amf` / `shiguredo_vpl`).
