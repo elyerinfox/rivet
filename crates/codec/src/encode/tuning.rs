@@ -515,7 +515,8 @@ pub fn qsv_av1_params(
         gop_pic_size: 0, // caller fills from keyframe_interval
         num_tile_columns: num_tile_columns as u8,
         num_tile_rows: num_tile_rows as u8,
-        low_power: MFX_CODINGOPTION_OFF,
+        // AV1 QSV encode is VDENC (low-power) only on Arc / Meteor Lake+.
+        low_power: MFX_CODINGOPTION_ON,
     }
 }
 
@@ -980,9 +981,10 @@ mod tests {
                     // TargetUsage is 1..7 per mfxstructs.h; we cap at
                     // 6 for Draft (av1-tuning-eng recommendation).
                     assert!((1..=6).contains(&p.target_usage));
-                    // LowPower must be explicit OFF — Draft tier must
-                    // not silently flip into the low-power path.
-                    assert_eq!(p.low_power, MFX_CODINGOPTION_OFF);
+                    // LowPower must be ON — AV1 QSV encode is VDENC-only on
+                    // Intel (the only AV1 encode entry point the iHD driver
+                    // exposes); OFF makes Query reject with MFX_ERR_UNSUPPORTED.
+                    assert_eq!(p.low_power, MFX_CODINGOPTION_ON);
                     assert!(p.num_tile_columns >= 1);
                     assert!(p.num_tile_rows >= 1);
                 }

@@ -189,11 +189,14 @@ struct MfxFrameInfo {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MfxInfoMfx {
-    reserved: [u32; 6],
-    low_power: u32,
+    // mfxInfoMFX: reserved[7] (28B), then LowPower (u16), BRCParamMultiplier
+    // (u16), then FrameInfo at offset 32. The old layout used reserved[6] +
+    // low_power:u32, which put `low_power` in a reserved slot (offset 24) and
+    // left the real LowPower (offset 28) at 0 — so AV1 on Arc (low-power-only)
+    // got LowPower=UNKNOWN and Query rejected it.
+    reserved: [u32; 7],
+    low_power: u16,
     brc_param_multiplier: u16,
-    // Pad to align the mfxFrameInfo start to the upstream offset.
-    _pad0: u16,
     frame_info: MfxFrameInfo,
     codec_id: u32,
     codec_profile: u16,
@@ -873,13 +876,13 @@ impl QsvEncoder {
             // vendored header.
 
             let mfx = MfxInfoMfx {
-                reserved: [0; 6],
-                // LowPower = MFX_CODINGOPTION_OFF (32). Explicit OFF per
-                // av1-tuning-eng review — the low-power path on older
-                // Arc silicon has documented quality regressions.
-                low_power: tp.low_power as u32,
+                reserved: [0; 7],
+                // LowPower from the tuning adapter. AV1 QSV encode is VDENC
+                // (low-power) on Arc / Meteor Lake+ — the only AV1 encode entry
+                // point the iHD driver exposes — so this must be ON, else Query
+                // rejects with MFX_ERR_UNSUPPORTED.
+                low_power: tp.low_power,
                 brc_param_multiplier: 0,
-                _pad0: 0,
                 frame_info,
                 codec_id: MFX_CODEC_AV1,
                 codec_profile: MFX_PROFILE_AV1_MAIN,
@@ -1535,10 +1538,9 @@ fn zeroed_video_param() -> MfxVideoParam {
         reserved3: 0,
         async_depth: 0,
         mfx: MfxInfoMfx {
-            reserved: [0; 6],
+            reserved: [0; 7],
             low_power: 0,
             brc_param_multiplier: 0,
-            _pad0: 0,
             frame_info: MfxFrameInfo {
                 bit_depth_luma: 0,
                 bit_depth_chroma: 0,
