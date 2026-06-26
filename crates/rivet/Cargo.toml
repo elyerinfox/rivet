@@ -1,0 +1,34 @@
+[package]
+name = "rivet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Modular GPU-accelerated video transcoding library and CLI (AV1 + Opus, MP4/CMAF-HLS)."
+
+[lib]
+name = "rivet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rivet"
+path = "src/main.rs"
+
+[dependencies]
+codec.workspace = true
+container.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+
+# Forward the optional ffmpeg decode backend through to the codec crate
+# so `cargo build -p rivet --features ffmpeg` lights up the libavcodec
+# primary decode path end-to-end.
+[features]
+default = []
+ffmpeg = ["codec/ffmpeg"]
+# Intel QuickSync / oneVPL hardware decode+encode (needs CMake + libvpl
+# toolchain; only useful on Intel Arc / Meteor Lake+ hosts).
+qsv = ["codec/qsv"]
