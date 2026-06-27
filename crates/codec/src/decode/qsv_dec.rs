@@ -473,8 +473,12 @@ impl QsvDecoder {
                 return None;
             }
             let s = &*surf;
-            let w = (s.info.crop_w.max(s.info.width)) as usize;
-            let h = (s.info.crop_h.max(s.info.height)) as usize;
+            // Output the DISPLAY (crop) dims, not the coded dims. e.g. 1080p
+            // codes as 1088 (16-aligned); emitting 1088-tall frames into a
+            // 1080-configured encoder fails EncodeFrameAsync. Crop is the
+            // displayable size; fall back to coded only if crop is unset.
+            let w = if s.info.crop_w > 0 { s.info.crop_w } else { s.info.width } as usize;
+            let h = if s.info.crop_h > 0 { s.info.crop_h } else { s.info.height } as usize;
             let pitch = s.data.pitch as usize | ((s.data.pitch_high as usize) << 16);
             let ch = h.div_ceil(2);
             let y_ptr = s.data.y;
