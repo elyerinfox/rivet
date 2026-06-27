@@ -1,4 +1,5 @@
 # OPEN ENCODING ATTRIBUTION LICENSE — Version 1.0
+
 >
 > **This is a SOURCE-AVAILABLE license, not an open-source license.** Because the
 > attribution duty in §5 applies only to commercial (for-profit) use, the License
@@ -14,15 +15,15 @@ Attribution Information from Exhibit A in one allowed location. "Notices (§4)" 
 existing notices and carry forward the `NOTICE` file. Note that §4 (notices) applies to
 **any** distribution, while §5 (visible credit) applies only to **commercial** use.*
 
-| Your use case | Allowed? | Royalty? | Modify / fork? | Show credit (§5) | Keep notices (§4) | Patent grant (§3) |
-|---|---|---|---|---|---|---|
-| **Personal / hobby / private** use | ✅ Yes | None | ✅ Yes | ❌ No (safe harbor) | ✅ if you distribute | ✅ Yes |
-| **Nonprofit, academic, research, or government** use | ✅ Yes | None | ✅ Yes | ❌ No (safe harbor) | ✅ if you distribute | ✅ Yes |
-| **Internal for-profit** use, nothing exposed to third parties | ✅ Yes | None | ✅ Yes | ❌ No ¹ | ✅ if you distribute | ✅ Yes |
-| **Ship in a commercial / for-profit product** | ✅ Yes | None | ✅ Yes | ✅ **Yes** | ✅ Yes | ✅ Yes |
-| **Run a commercial / for-profit service** (the "YouTube" case) | ✅ Yes | None | ✅ Yes | ✅ **Yes** ² | ✅ if you distribute | ✅ Yes |
-| **Fork into a copyleft / GPL project** | ⚠️ See ³ | None | ✅ Yes | per row above | ✅ Yes | ✅ Yes |
-| **Sue a contributor over their patents** | — | — | — | — | — | ❌ **Revoked** ⁴ |
+| Your use case                                                  | Allowed? | Royalty? | Modify / fork? | Show credit (§5)   | Keep notices (§4)   | Patent grant (§3) |
+|----------------------------------------------------------------|----------|----------|----------------|--------------------|---------------------|-------------------|
+| **Personal / hobby / private** use                             | ✅ Yes    | None     | ✅ Yes          | ❌ No (safe harbor) | ✅ if you distribute | ✅ Yes             |
+| **Nonprofit, academic, research, or government** use           | ✅ Yes    | None     | ✅ Yes          | ❌ No (safe harbor) | ✅ if you distribute | ✅ Yes             |
+| **Internal for-profit** use, nothing exposed to third parties  | ✅ Yes    | None     | ✅ Yes          | ❌ No ¹             | ✅ if you distribute | ✅ Yes             |
+| **Ship in a commercial / for-profit product**                  | ✅ Yes    | None     | ✅ Yes          | ✅ **Yes**          | ✅ Yes               | ✅ Yes             |
+| **Run a commercial / for-profit service** (the "YouTube" case) | ✅ Yes    | None     | ✅ Yes          | ✅ **Yes** ²        | ✅ if you distribute | ✅ Yes             |
+| **Fork into a copyleft / GPL project**                         | ⚠️ See ³ | None     | ✅ Yes          | per row above      | ✅ Yes               | ✅ Yes             |
+| **Sue a contributor over their patents**                       | —        | —        | —              | —                  | —                   | ❌ **Revoked** ⁴   |
 
 **¹ Internal-only carve-out.** A purely internal commercial tool shows the credit to no
 audience, so §5 does not fire. To require the credit for *all* for-profit use (including

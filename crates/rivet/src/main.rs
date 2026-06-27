@@ -30,11 +30,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 use rivet::progress::{RungProgress, RungStatus};
-use rivet::spec::{
-    AudioPolicy, BitDepth, ChunkSeamMode, ColorPolicy, EncodePolicy, GpuFamily, OutputSpec,
-    Quality, Rung,
-};
-use rivet::{JobOutput, RungArtifact};
+use rivet::spec::{AudioPolicy, BitDepth, ChunkSeamMode, ColorPolicy, GpuFamily};
+use rivet::{JobOutput, RungArtifact, TranscodeSettings};
 
 #[derive(Parser)]
 #[command(
@@ -280,11 +277,12 @@ enum Command {
         #[arg(long)]
         gpu: Option<u32>,
     },
-    /// Run a **Unix-domain-socket** IPC server (Unix only). Each connection: the
-    /// client writes media, half-closes its write side, then reads the
-    /// transcoded AV1/MP4 back. Per-job settings can prefix the stream as a
-    /// `#rivet key=value …\n` header line. Lets an app stream data in and out
-    /// without HTTP or temp files.
+    /// Run a **Unix-domain-socket** IPC server (needs the `ipc` feature; Unix
+    /// only at runtime). Each connection: the client writes media, half-closes
+    /// its write side, then reads the transcoded AV1/MP4 back. Per-job settings
+    /// can prefix the stream as a `#rivet key=value …\n` header line. Lets an
+    /// app stream data in and out without HTTP or temp files.
+    #[cfg(feature = "ipc")]
     Ipc {
         /// Socket path to bind, e.g. `/tmp/rivet.sock`.
         #[arg(long)]
@@ -385,7 +383,7 @@ fn run() -> Result<()> {
             width,
             height,
             gpu,
-        } => pipe_cmd(JobSettings {
+        } => pipe_cmd(TranscodeSettings {
             crf,
             speed,
             audio: audio.map(Into::into),
@@ -395,7 +393,9 @@ fn run() -> Result<()> {
             width,
             height,
             gpu,
+            ..Default::default()
         }),
+        #[cfg(feature = "ipc")]
         Command::Ipc { socket } => ipc_cmd(&socket),
         #[cfg(feature = "server")]
         Command::Serve { addr } => {
@@ -438,43 +438,39 @@ fn transcode_cmd(args: TranscodeArgs) -> Result<()> {
     // Probe to resolve the ladder when not given explicitly.
     let probed = rivet::probe_bytes(&bytes).context("probing input")?;
 
-    let quality = Quality {
+    // Build the canonical `TranscodeSettings` (the same knob set the HTTP API
+    // and pipe/ipc fill), then the one shared spec builder.
+    let rungs = args
+        .rungs
+        .iter()
+        .map(|s| parse_wxh(s))
+        .collect::<Result<Vec<_>>>()?;
+    let settings = TranscodeSettings {
+        mode: Some(match args.mode {
+            ModeArg::Single => rivet::Mode::Single,
+            ModeArg::Hls => rivet::Mode::Hls,
+        }),
+        rungs,
+        ladder: args.ladder,
+        max_short_side: args.max_short_side,
+        segment_seconds: Some(args.segment_seconds),
         crf: args.crf,
-        speed_preset: args.speed,
-        ..Default::default()
+        speed: args.speed,
+        audio: Some(args.audio.into()),
+        color: Some(args.color.into()),
+        bit_depth: Some(args.pixel_format.into()),
+        seam: Some(args.seam_mode.into()),
+        max_fps: args.max_fps,
+        gpu: args.gpu,
+        gpu_family: args.gpu_family.map(Into::into),
+        single_gpu: args.single_gpu,
+        decode_gpu: args.decode_gpu,
+        width: None,
+        height: None,
     };
-
-    let rungs = resolve_rungs(&args, &probed, &quality)?;
-    if rungs.is_empty() {
-        bail!("no rungs to produce (check --rung / --ladder and the source resolution)");
-    }
-
-    let audio = match args.audio {
-        AudioArg::Auto => AudioPolicy::Auto,
-        AudioArg::Opus => AudioPolicy::ForceOpus,
-        AudioArg::Drop => AudioPolicy::Drop,
-    };
-
-    let mut spec = match args.mode {
-        ModeArg::Single => OutputSpec::single_file(rungs),
-        ModeArg::Hls => OutputSpec::hls(rungs, args.segment_seconds),
-    };
-    spec.audio = audio;
-    spec.max_frame_rate = args.max_fps;
-    spec = if let Some(idx) = args.gpu {
-        spec.encode_policy(EncodePolicy::SingleGpu(Some(idx)))
-    } else if let Some(fam) = args.gpu_family {
-        spec.encode_policy(EncodePolicy::Family(fam.into()))
-    } else if args.single_gpu {
-        spec.encode_policy(EncodePolicy::SingleGpu(None))
-    } else {
-        spec.encode_policy(EncodePolicy::AllGpus)
-    };
-    spec = spec.decode_gpu(args.decode_gpu);
-    spec = spec
-        .with_color(args.color.into())
-        .with_bit_depth(args.pixel_format.into())
-        .chunk_seam_mode(args.seam_mode.into());
+    let spec = settings
+        .into_spec(probed.width, probed.height)
+        .context("building output spec")?;
 
     // Progress: one carriage-return line per rung update.
     let sink = Arc::new(rivet::fn_sink(|p: RungProgress| {
@@ -505,31 +501,6 @@ fn transcode_cmd(args: TranscodeArgs) -> Result<()> {
 }
 
 /// Build the rung list from `--rung` / `--ladder` / default-source.
-fn resolve_rungs(args: &TranscodeArgs, probed: &rivet::MediaInfo, quality: &Quality) -> Result<Vec<Rung>> {
-    if !args.rungs.is_empty() {
-        let mut out = Vec::new();
-        for s in &args.rungs {
-            let (w, h) = parse_wxh(s)?;
-            out.push(Rung::new(w, h).with_quality(quality.clone()));
-        }
-        return Ok(out);
-    }
-    if args.ladder {
-        return Ok(rivet::ladder::standard_ladder_with_quality(
-            probed.width,
-            probed.height,
-            args.max_short_side,
-            quality.clone(),
-        ));
-    }
-    // Default: single rung at the source resolution.
-    let (w, h) = (probed.width & !1, probed.height & !1);
-    if w == 0 || h == 0 {
-        bail!("source resolution unknown ({}x{}); specify --rung", probed.width, probed.height);
-    }
-    Ok(vec![Rung::new(w, h).with_quality(quality.clone())])
-}
-
 /// Decide where outputs go. Returns (hls/multi output dir, single-file target).
 fn plan_output(args: &TranscodeArgs) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
     match args.mode {
@@ -890,146 +861,52 @@ fn capabilities_cmd(json: bool) {
     }
 }
 
-// ── streaming transcode settings (shared by `pipe` flags / `ipc` header) ──
-
-/// Per-job settings for the streaming paths. All-`None` keeps the single-file
-/// default (fast `transcode_bytes` path); any set field routes through the full
-/// `run_job` single-file engine (scale / color / bit-depth / quality / audio /
-/// gpu). `pipe` fills this from CLI flags; `ipc` from a `#rivet k=v …` header.
-#[derive(Default, Clone)]
-struct JobSettings {
-    crf: Option<u8>,
-    speed: Option<u8>,
-    audio: Option<AudioPolicy>,
-    color: Option<ColorPolicy>,
-    bit_depth: Option<BitDepth>,
-    max_fps: Option<f64>,
-    width: Option<u32>,
-    height: Option<u32>,
-    gpu: Option<u32>,
-}
-
-impl JobSettings {
-    fn is_empty(&self) -> bool {
-        self.crf.is_none()
-            && self.speed.is_none()
-            && self.audio.is_none()
-            && self.color.is_none()
-            && self.bit_depth.is_none()
-            && self.max_fps.is_none()
-            && self.width.is_none()
-            && self.height.is_none()
-            && self.gpu.is_none()
-    }
-
-    /// Parse a `key=value key=value …` line (the `rivet ipc` header body).
-    fn parse_kv(line: &str) -> Result<Self> {
-        let mut s = Self::default();
-        for tok in line.split_whitespace() {
-            let (k, v) = tok
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("bad setting '{tok}' (expected key=value)"))?;
-            match k {
-                "crf" => s.crf = Some(v.parse().context("crf")?),
-                "speed" => s.speed = Some(v.parse().context("speed")?),
-                "audio" => {
-                    s.audio = Some(match v {
-                        "auto" => AudioPolicy::Auto,
-                        "opus" => AudioPolicy::ForceOpus,
-                        "drop" => AudioPolicy::Drop,
-                        o => bail!("audio must be auto|opus|drop, got '{o}'"),
-                    })
-                }
-                "color" => {
-                    s.color = Some(match v {
-                        "sdr" => ColorPolicy::TonemapToSdr,
-                        "hdr10" => ColorPolicy::Hdr10,
-                        "hlg" => ColorPolicy::Hlg,
-                        "passthrough" => ColorPolicy::Passthrough,
-                        o => bail!("color must be sdr|hdr10|hlg|passthrough, got '{o}'"),
-                    })
-                }
-                "bit-depth" | "pixel-format" => {
-                    s.bit_depth = Some(match v {
-                        "auto" => BitDepth::Auto,
-                        "8bit" => BitDepth::EightBit,
-                        "10bit" => BitDepth::TenBit,
-                        o => bail!("bit-depth must be auto|8bit|10bit, got '{o}'"),
-                    })
-                }
-                "max-fps" => s.max_fps = Some(v.parse().context("max-fps")?),
-                "width" => s.width = Some(v.parse().context("width")?),
-                "height" => s.height = Some(v.parse().context("height")?),
-                "gpu" => s.gpu = Some(v.parse().context("gpu")?),
-                o => bail!(
-                    "unknown setting '{o}' (crf/speed/audio/color/bit-depth/max-fps/width/height/gpu)"
-                ),
-            }
-        }
-        Ok(s)
-    }
-
-    /// Build a single-file `OutputSpec` from these settings, run it, and return
-    /// `(mp4_bytes, frames, audio_label)`.
-    fn run(&self, input: &[u8]) -> Result<(Vec<u8>, u64, String)> {
-        let probed = rivet::probe_bytes(input).context("probing input")?;
-        let w = self.width.unwrap_or(probed.width);
-        let h = self.height.unwrap_or(probed.height);
-        if w == 0 || h == 0 {
-            bail!("could not determine output size from the source — set width=/height=");
-        }
-        let quality = Quality {
-            crf: self.crf,
-            speed_preset: self.speed,
-            ..Default::default()
-        };
-        let mut spec = OutputSpec::single_file(vec![Rung::new(w, h).with_quality(quality)]);
-        if let Some(a) = self.audio {
-            spec.audio = a;
-        }
-        spec.max_frame_rate = self.max_fps;
-        if let Some(g) = self.gpu {
-            spec = spec.encode_policy(EncodePolicy::SingleGpu(Some(g)));
-        }
-        if let Some(c) = self.color {
-            spec = spec.with_color(c);
-        }
-        if let Some(b) = self.bit_depth {
-            spec = spec.with_bit_depth(b);
-        }
-        spec.validate().context("invalid settings")?;
-        let sink = Arc::new(rivet::fn_sink(|_p: RungProgress| {}));
-        let out = rivet::run_job_blocking(input, &spec, None, sink).context("transcoding")?;
-        let audio = out.audio_handling.clone();
-        for r in out.rungs {
-            let frames = r.frames;
-            if let rivet::RungArtifact::File(bytes) = r.artifact {
-                return Ok((bytes, frames, audio));
-            }
-        }
-        bail!("no single-file output produced")
-    }
-}
+// ── streaming transcode (shared by `pipe` flags / `ipc` header) ──
+//
+// Both surfaces fill a `rivet::TranscodeSettings` — the one canonical knob set,
+// the same type the CLI `transcode` and the HTTP API build — and run it here.
+// `pipe` fills it from CLI flags; `ipc` from a `#rivet key=value …` header via
+// `TranscodeSettings::parse_kv_line`.
 
 /// Transcode `input` honoring `settings`: all-default settings take the fast
-/// `transcode_bytes` path; any set field routes through the full `run_job`
-/// single-file engine. Returns `(mp4_bytes, frames, audio_label)`.
-fn stream_transcode(input: &[u8], settings: &JobSettings) -> Result<(Vec<u8>, u64, String)> {
+/// `transcode_bytes` path; any set field routes through the shared
+/// `TranscodeSettings::into_spec` + the full `run_job` single-file engine.
+/// Returns `(mp4_bytes, frames, audio_label)`.
+fn stream_transcode(input: &[u8], settings: &TranscodeSettings) -> Result<(Vec<u8>, u64, String)> {
     if settings.is_empty() {
         let out = rivet::transcode_bytes(input).context("transcoding")?;
-        Ok((
+        return Ok((
             out.output_bytes,
             out.frames_processed,
             out.audio_handling.label(),
-        ))
-    } else {
-        settings.run(input)
+        ));
     }
+    let probed = rivet::probe_bytes(input).context("probing input")?;
+    let spec = settings
+        .clone()
+        .into_spec(probed.width, probed.height)
+        .context("invalid settings")?;
+    if matches!(spec.mode, rivet::OutputMode::Hls { .. }) {
+        bail!(
+            "HLS/segmented output isn't supported over pipe/ipc (a single stream) — \
+             use `rivet transcode -o <dir>` or the HTTP API"
+        );
+    }
+    let sink = Arc::new(rivet::fn_sink(|_p: RungProgress| {}));
+    let out = rivet::run_job_blocking(input, &spec, None, sink).context("transcoding")?;
+    let audio = out.audio_handling.clone();
+    for r in out.rungs {
+        let frames = r.frames;
+        if let rivet::RungArtifact::File(bytes) = r.artifact {
+            return Ok((bytes, frames, audio));
+        }
+    }
+    bail!("no single-file output produced")
 }
 
 // ── `rivet pipe` — stdin → stdout streaming ────────────────────────
 
-fn pipe_cmd(settings: JobSettings) -> Result<()> {
+fn pipe_cmd(settings: TranscodeSettings) -> Result<()> {
     use std::io::{Read, Write};
     let mut input = Vec::new();
     std::io::stdin()
@@ -1053,8 +930,8 @@ fn pipe_cmd(settings: JobSettings) -> Result<()> {
 /// Split an optional `#rivet key=value …\n` settings header off the front of
 /// the stream. Real container magic bytes never start with `#rivet`, so this is
 /// unambiguous. Returns the parsed settings and the remaining media slice.
-#[cfg(unix)]
-fn split_ipc_settings(input: &[u8]) -> (Result<JobSettings>, &[u8]) {
+#[cfg(all(feature = "ipc", unix))]
+fn split_ipc_settings(input: &[u8]) -> (Result<TranscodeSettings>, &[u8]) {
     const MAGIC: &[u8] = b"#rivet";
     if input.starts_with(MAGIC) {
         let nl = input.iter().position(|&b| b == b'\n').unwrap_or(input.len());
@@ -1062,13 +939,13 @@ fn split_ipc_settings(input: &[u8]) -> (Result<JobSettings>, &[u8]) {
         let line = std::str::from_utf8(&input[MAGIC.len()..nl])
             .map(str::trim)
             .unwrap_or("");
-        (JobSettings::parse_kv(line), &input[media_start..])
+        (TranscodeSettings::parse_kv_line(line), &input[media_start..])
     } else {
-        (Ok(JobSettings::default()), input)
+        (Ok(TranscodeSettings::default()), input)
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "ipc", unix))]
 fn ipc_cmd(socket: &Path) -> Result<()> {
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -1128,7 +1005,7 @@ fn ipc_cmd(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(feature = "ipc", not(unix)))]
 fn ipc_cmd(_socket: &Path) -> Result<()> {
     bail!(
         "`rivet ipc` (Unix-domain socket) is Unix-only. On Windows, use \

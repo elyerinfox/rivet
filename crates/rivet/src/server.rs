@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as AxPath, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
@@ -38,9 +38,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::progress::{ProgressSink, RungProgress, RungStatus};
-use crate::spec::{
-    AudioPolicy, ChunkSeamMode, ColorPolicy, OutputSpec, BitDepth, Quality, Rung,
-};
+use crate::settings::TranscodeSettings;
+use crate::spec::OutputSpec;
 
 /// 4 GiB upload ceiling — large enough for long source files.
 const MAX_UPLOAD: usize = 4 * 1024 * 1024 * 1024;
@@ -87,8 +86,12 @@ struct ArtifactEntry {
     height: u32,
     frames: u64,
     bytes: u64,
-    /// In-memory MP4 bytes for a single-file rung; `None` for an HLS rendition.
+    /// In-memory MP4 bytes for a single-file rung held in RAM; `None` for an
+    /// HLS rendition or when the bytes were written to `output_path`.
     data: Option<Bytes>,
+    /// Server-side path the artifact was written to (when the request supplied
+    /// `output.path`); surfaced in the status JSON.
+    output_path: Option<String>,
 }
 
 struct JobHandle {
@@ -136,17 +139,23 @@ impl JobHandle {
             .unwrap()
             .iter()
             .map(|a| {
+                // Download URL only when bytes are held in RAM; when written to
+                // disk (`output_path`) the caller already has the path.
+                let url = if a.data.is_some() {
+                    Some(format!("/v1/jobs/{}/artifacts/{}", self.id, a.label))
+                } else if a.output_path.is_none() {
+                    Some(format!("/v1/jobs/{}/files/", self.id))
+                } else {
+                    None
+                };
                 json!({
                     "label": a.label,
                     "width": a.width,
                     "height": a.height,
                     "frames": a.frames,
                     "bytes": a.bytes,
-                    "url": if a.data.is_some() {
-                        format!("/v1/jobs/{}/artifacts/{}", self.id, a.label)
-                    } else {
-                        format!("/v1/jobs/{}/files/", self.id)
-                    },
+                    "url": url,
+                    "output_path": a.output_path,
                 })
             })
             .collect();
@@ -203,7 +212,7 @@ impl ProgressSink for RegistrySink {
 // Request → OutputSpec
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 struct TranscodeParams {
     /// `single` (default) or `hls`.
     mode: Option<String>,
@@ -231,84 +240,223 @@ struct TranscodeParams {
     sync: Option<bool>,
 }
 
-fn parse_rungs(spec: &str, q: &Quality) -> Result<Vec<Rung>> {
-    let mut out = Vec::new();
-    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (w, h) = part
-            .split_once(['x', 'X'])
-            .context("rung must be WxH, e.g. 1280x720")?;
-        let w: u32 = w.trim().parse().context("rung width")?;
-        let h: u32 = h.trim().parse().context("rung height")?;
-        out.push(Rung::new(w, h).with_quality(q.clone()));
+// ---------------------------------------------------------------------------
+// Structured JSON request body
+// ---------------------------------------------------------------------------
+
+/// A `POST /v1/transcode` body sent as `application/json`. The spec is a
+/// structured object (not query params); the media comes from a server-side
+/// **file path** or **inline base64** instead of a streamed binary body, and
+/// the output can be written to a server **file path** instead of held in RAM.
+#[derive(Deserialize)]
+struct TranscodeRequest {
+    /// Where to read the input media from (`path` or `base64`).
+    input: InputSource,
+    /// Optional: write the result to a server path instead of keeping it in
+    /// memory. A file for single-rung single-file; a directory for multi-rung
+    /// or HLS.
+    #[serde(default)]
+    output: Option<OutputTarget>,
+    /// The output spec (structured form of the query params).
+    #[serde(default)]
+    spec: SpecBody,
+    /// Block until the job finishes (stream/summarize the result) instead of
+    /// returning a job id immediately.
+    #[serde(default)]
+    sync: bool,
+}
+
+/// The media source for a JSON request: exactly one of `path` / `base64`.
+#[derive(Deserialize)]
+struct InputSource {
+    /// A file path on the **server** to read the media from.
+    #[serde(default)]
+    path: Option<String>,
+    /// The media inline, base64-encoded (standard alphabet).
+    #[serde(default)]
+    base64: Option<String>,
+}
+
+/// Where to write the result of a JSON request.
+#[derive(Deserialize)]
+struct OutputTarget {
+    /// A file path (single-file single-rung) or directory (multi-rung / HLS)
+    /// on the **server**.
+    path: String,
+}
+
+/// The structured spec body (mirrors [`TranscodeParams`] but with `rungs` as a
+/// real array). Converts into `TranscodeParams` so it reuses [`build_spec`].
+#[derive(Deserialize, Default)]
+struct SpecBody {
+    mode: Option<String>,
+    /// Explicit rungs as `["1280x720", "640x360"]`.
+    #[serde(default)]
+    rungs: Vec<String>,
+    ladder: Option<bool>,
+    max_short_side: Option<u32>,
+    segment_seconds: Option<f32>,
+    crf: Option<u8>,
+    speed: Option<u8>,
+    audio: Option<String>,
+    color: Option<String>,
+    /// `auto` | `8bit` | `10bit` (accepts the legacy key `pixel_format` too).
+    #[serde(alias = "pixel_format")]
+    bit_depth: Option<String>,
+    seam: Option<String>,
+    max_fps: Option<f64>,
+    gpu: Option<u32>,
+}
+
+impl SpecBody {
+    fn into_params(self) -> TranscodeParams {
+        TranscodeParams {
+            mode: self.mode,
+            rungs: (!self.rungs.is_empty()).then(|| self.rungs.join(",")),
+            ladder: self.ladder,
+            max_short_side: self.max_short_side,
+            segment_seconds: self.segment_seconds,
+            crf: self.crf,
+            speed: self.speed,
+            audio: self.audio,
+            color: self.color,
+            pixel_format: self.bit_depth,
+            seam: self.seam,
+            max_fps: self.max_fps,
+            gpu: self.gpu,
+            sync: None,
+        }
     }
-    if out.is_empty() {
-        anyhow::bail!("no rungs parsed from '{spec}'");
+}
+
+/// Read the media for a JSON request from its `path` or `base64` field.
+fn read_input(src: &InputSource) -> Result<Bytes, ApiError> {
+    match (&src.path, &src.base64) {
+        (Some(p), None) => {
+            let path = resolve_path(p, true)?;
+            let bytes = std::fs::read(&path)
+                .map_err(|e| ApiError::bad_request(anyhow::anyhow!("reading input {p}: {e}")))?;
+            Ok(Bytes::from(bytes))
+        }
+        (None, Some(b)) => {
+            let bytes = base64_decode(b.trim())
+                .map_err(|e| ApiError::bad_request(anyhow::anyhow!("input.base64: {e}")))?;
+            Ok(Bytes::from(bytes))
+        }
+        (Some(_), Some(_)) => Err(ApiError::bad_request(anyhow::anyhow!(
+            "input: set exactly one of `path` or `base64`"
+        ))),
+        (None, None) => Err(ApiError::bad_request(anyhow::anyhow!(
+            "input: set `path` or `base64`"
+        ))),
+    }
+}
+
+/// Resolve a request-supplied file path. When `RIVET_FILE_ROOT` is set, the
+/// path must canonicalize **under** that root (sandbox); otherwise any path is
+/// allowed (the server binds localhost by default — treat it as trusted-local).
+/// `must_exist` requires an existing file (input); else only the parent dir
+/// must exist (output).
+fn resolve_path(p: &str, must_exist: bool) -> Result<PathBuf, ApiError> {
+    let path = PathBuf::from(p);
+    let root = std::env::var_os("RIVET_FILE_ROOT").map(PathBuf::from);
+
+    let resolved = if must_exist {
+        std::fs::canonicalize(&path)
+            .map_err(|_| ApiError::bad_request(anyhow::anyhow!("input path not found: {p}")))?
+    } else {
+        let parent = path.parent().filter(|s| !s.as_os_str().is_empty());
+        let file = path
+            .file_name()
+            .ok_or_else(|| ApiError::bad_request(anyhow::anyhow!("invalid output path: {p}")))?;
+        let cparent = match parent {
+            Some(par) => std::fs::canonicalize(par).map_err(|_| {
+                ApiError::bad_request(anyhow::anyhow!("output directory not found: {}", par.display()))
+            })?,
+            None => std::env::current_dir()
+                .map_err(|e| ApiError::internal(anyhow::anyhow!("cwd: {e}")))?,
+        };
+        cparent.join(file)
+    };
+
+    if let Some(root) = root {
+        let croot = std::fs::canonicalize(&root).unwrap_or(root);
+        if !resolved.starts_with(&croot) {
+            return Err(ApiError::bad_request(anyhow::anyhow!(
+                "path escapes RIVET_FILE_ROOT sandbox"
+            )));
+        }
+    }
+    Ok(resolved)
+}
+
+/// Minimal standard-alphabet base64 decoder (no padding required). Avoids a
+/// dependency for the JSON `input.base64` convenience.
+fn base64_decode(s: &str) -> Result<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &c in s.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = val(c).context("invalid base64 character")? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
     }
     Ok(out)
 }
 
-fn build_spec(params: &TranscodeParams, src_w: u32, src_h: u32) -> Result<OutputSpec> {
-    let quality = Quality {
-        crf: params.crf,
-        speed_preset: params.speed,
-        ..Default::default()
-    };
-
-    let rungs = if let Some(r) = &params.rungs {
-        parse_rungs(r, &quality)?
-    } else if params.ladder.unwrap_or(false) {
-        crate::ladder::standard_ladder(src_w, src_h, params.max_short_side)
-            .into_iter()
-            .map(|r| r.with_quality(quality.clone()))
-            .collect()
-    } else {
-        vec![Rung::new(src_w, src_h).with_quality(quality.clone())]
-    };
-
-    let mode = params.mode.as_deref().unwrap_or("single");
-    let mut spec = match mode {
-        "hls" => OutputSpec::hls(rungs, params.segment_seconds.unwrap_or(4.0)),
-        "single" => OutputSpec::single_file(rungs),
-        other => anyhow::bail!("unknown mode '{other}' (expected single|hls)"),
-    };
-
-    spec.audio = match params.audio.as_deref() {
-        Some("opus") => AudioPolicy::ForceOpus,
-        Some("drop") => AudioPolicy::Drop,
-        Some("auto") | None => AudioPolicy::Auto,
-        Some(o) => anyhow::bail!("unknown audio '{o}' (expected auto|opus|drop)"),
-    };
-    spec.max_frame_rate = params.max_fps;
-    if let Some(c) = &params.color {
-        spec.color = match c.as_str() {
-            "sdr" => ColorPolicy::TonemapToSdr,
-            "hdr10" => ColorPolicy::Hdr10,
-            "hlg" => ColorPolicy::Hlg,
-            "passthrough" => ColorPolicy::Passthrough,
-            o => anyhow::bail!("unknown color '{o}'"),
-        };
+impl TranscodeParams {
+    /// Map the (string) query/JSON params onto the canonical
+    /// [`TranscodeSettings`] using the shared `settings::parse_*` vocabulary —
+    /// so the API doesn't carry its own copy of the field/spec logic.
+    fn into_settings(&self) -> Result<TranscodeSettings> {
+        use crate::settings::{parse_audio, parse_color, parse_bit_depth, parse_mode, parse_rung, parse_seam};
+        let mut s = TranscodeSettings::default();
+        if let Some(m) = &self.mode {
+            s.mode = Some(parse_mode(m)?);
+        }
+        if let Some(r) = &self.rungs {
+            for part in r.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                s.rungs.push(parse_rung(part)?);
+            }
+        }
+        s.ladder = self.ladder.unwrap_or(false);
+        s.max_short_side = self.max_short_side;
+        s.segment_seconds = self.segment_seconds;
+        s.crf = self.crf;
+        s.speed = self.speed;
+        if let Some(a) = &self.audio {
+            s.audio = Some(parse_audio(a)?);
+        }
+        if let Some(c) = &self.color {
+            s.color = Some(parse_color(c)?);
+        }
+        if let Some(p) = &self.pixel_format {
+            s.bit_depth = Some(parse_bit_depth(p)?);
+        }
+        if let Some(sm) = &self.seam {
+            s.seam = Some(parse_seam(sm)?);
+        }
+        s.max_fps = self.max_fps;
+        s.gpu = self.gpu;
+        Ok(s)
     }
-    if let Some(p) = &params.pixel_format {
-        spec.bit_depth = match p.as_str() {
-            "auto" => BitDepth::Auto,
-            "8bit" => BitDepth::EightBit,
-            "10bit" => BitDepth::TenBit,
-            o => anyhow::bail!("unknown pixel_format '{o}'"),
-        };
-    }
-    if let Some(s) = &params.seam {
-        spec.chunk_seam_mode = match s.as_str() {
-            "parallel" => ChunkSeamMode::Parallel,
-            "constqp" => ChunkSeamMode::ParallelConstQp,
-            "serial" => ChunkSeamMode::Serial,
-            o => anyhow::bail!("unknown seam '{o}'"),
-        };
-    }
-    if let Some(g) = params.gpu {
-        spec = spec.with_gpu_index(g);
-    }
-    spec.validate().context("invalid output spec")?;
-    Ok(spec)
 }
 
 // ---------------------------------------------------------------------------
@@ -371,23 +519,58 @@ async fn probe(body: Bytes) -> Result<Json, ApiError> {
 
 async fn transcode(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<TranscodeParams>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    if body.is_empty() {
-        return Err(ApiError::bad_request(anyhow::anyhow!("empty request body (POST the media bytes)")));
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("application/json"))
+        .unwrap_or(false);
+
+    // Two ways to submit: a structured JSON body (file path / inline base64,
+    // optional server-side output path) or a streamed binary body + query spec.
+    let (media, spec_params, output_path, sync) = if is_json {
+        let req: TranscodeRequest = serde_json::from_slice(&body)
+            .map_err(|e| ApiError::bad_request(anyhow::anyhow!("invalid JSON body: {e}")))?;
+        let media = read_input(&req.input)?;
+        let output_path = match &req.output {
+            Some(o) => Some(resolve_path(&o.path, false)?),
+            None => None,
+        };
+        (media, req.spec.into_params(), output_path, req.sync)
+    } else {
+        if body.is_empty() {
+            return Err(ApiError::bad_request(anyhow::anyhow!(
+                "empty request body — POST media bytes (binary), or send `application/json` with input.path / input.base64"
+            )));
+        }
+        let sync = params.sync.unwrap_or(false);
+        (body, params, None, sync)
+    };
+
+    if media.is_empty() {
+        return Err(ApiError::bad_request(anyhow::anyhow!("no input media")));
     }
+
     // Probe the source so `ladder`/source-resolution rungs and validation work.
-    let info = crate::probe::probe_bytes(&body).map_err(ApiError::bad_request)?;
-    let spec = build_spec(&params, info.width, info.height).map_err(ApiError::bad_request)?;
+    let info = crate::probe::probe_bytes(&media).map_err(ApiError::bad_request)?;
+    let settings = spec_params.into_settings().map_err(ApiError::bad_request)?;
+    let spec = settings
+        .into_spec(info.width, info.height)
+        .map_err(ApiError::bad_request)?;
 
     let id = Uuid::new_v4();
-    let mode = params.mode.clone().unwrap_or_else(|| "single".into());
-    let handle = Arc::new(JobHandle::new(id, &mode));
+    let mode = if matches!(spec.mode, crate::spec::OutputMode::Hls { .. }) {
+        "hls"
+    } else {
+        "single"
+    };
+    let handle = Arc::new(JobHandle::new(id, mode));
     state.jobs.write().unwrap().insert(id, Arc::clone(&handle));
 
-    let sync = params.sync.unwrap_or(false);
-    let task = run_job_task(Arc::clone(&handle), body, spec);
+    let task = run_job_task(Arc::clone(&handle), media, spec, output_path);
 
     if sync {
         task.await; // run inline
@@ -401,31 +584,65 @@ async fn transcode(
         .into_response())
 }
 
-/// The actual transcode future (shared by the async + sync paths).
+/// Write one single-file rung's MP4 to a server path: the path itself for a
+/// lone rung, or `<dir>/<label>.mp4` when there are several. Returns the path.
+fn write_single_file(bytes: &[u8], output: &std::path::Path, label: &str, multi: bool) -> Result<String, String> {
+    let dest = if multi {
+        std::fs::create_dir_all(output).map_err(|e| format!("creating {}: {e}", output.display()))?;
+        output.join(format!("{label}.mp4"))
+    } else {
+        output.to_path_buf()
+    };
+    std::fs::write(&dest, bytes).map_err(|e| format!("writing {}: {e}", dest.display()))?;
+    Ok(dest.display().to_string())
+}
+
+/// The actual transcode future (shared by the async + sync paths). When
+/// `output_path` is set, artifacts are written to the server filesystem
+/// (single-file MP4 bytes, or the HLS tree as the asset root) instead of being
+/// held in RAM.
 fn run_job_task(
     handle: Arc<JobHandle>,
     body: Bytes,
     spec: OutputSpec,
+    output_path: Option<PathBuf>,
 ) -> impl std::future::Future<Output = ()> {
     async move {
         handle.set_phase(Phase::Running);
-        // HLS needs an on-disk asset root; single-file keeps bytes in RAM.
-        let tmp = if matches!(spec.mode, crate::spec::OutputMode::Hls { .. }) {
-            match tempfile::Builder::new().prefix("rivet-api-").tempdir() {
-                Ok(d) => {
-                    *handle.output_dir.lock().unwrap() = Some(d.path().to_path_buf());
-                    Some(d)
-                }
-                Err(e) => {
-                    *handle.error.lock().unwrap() = Some(format!("tempdir: {e}"));
+        let is_hls = matches!(spec.mode, crate::spec::OutputMode::Hls { .. });
+
+        // HLS needs an on-disk asset root: honor `output_path` if given, else a
+        // tempdir we keep alive for the process. Single-file keeps bytes in RAM
+        // unless `output_path` is set (then it's written below).
+        let mut tmp_guard = None;
+        let out_dir: Option<PathBuf> = if is_hls {
+            if let Some(p) = &output_path {
+                if let Err(e) = std::fs::create_dir_all(p) {
+                    *handle.error.lock().unwrap() =
+                        Some(format!("creating output dir {}: {e}", p.display()));
                     handle.set_phase(Phase::Failed);
                     return;
+                }
+                *handle.output_dir.lock().unwrap() = Some(p.clone());
+                Some(p.clone())
+            } else {
+                match tempfile::Builder::new().prefix("rivet-api-").tempdir() {
+                    Ok(d) => {
+                        let path = d.path().to_path_buf();
+                        *handle.output_dir.lock().unwrap() = Some(path.clone());
+                        tmp_guard = Some(d);
+                        Some(path)
+                    }
+                    Err(e) => {
+                        *handle.error.lock().unwrap() = Some(format!("tempdir: {e}"));
+                        handle.set_phase(Phase::Failed);
+                        return;
+                    }
                 }
             }
         } else {
             None
         };
-        let out_dir = tmp.as_ref().map(|d| d.path().to_path_buf());
 
         let sink: Arc<dyn ProgressSink> = Arc::new(RegistrySink {
             handle: Arc::clone(&handle),
@@ -433,27 +650,48 @@ fn run_job_task(
         let result = crate::job::run_job(body, &spec, out_dir.as_deref(), sink).await;
         match result {
             Ok(out) => {
-                let mut arts = handle.artifacts.lock().unwrap();
-                for r in out.rungs {
-                    let data = match r.artifact {
-                        crate::job::RungArtifact::File(bytes) => Some(Bytes::from(bytes)),
-                        crate::job::RungArtifact::HlsRendition { .. } => None,
-                    };
-                    arts.push(ArtifactEntry {
-                        label: r.label,
-                        width: r.width,
-                        height: r.height,
-                        frames: r.frames,
-                        bytes: r.bytes,
-                        data,
-                    });
+                let multi = out.rungs.len() > 1;
+                let mut write_err: Option<String> = None;
+                {
+                    let mut arts = handle.artifacts.lock().unwrap();
+                    for r in out.rungs {
+                        let (data, written) = match r.artifact {
+                            crate::job::RungArtifact::File(bytes) => {
+                                if let Some(p) = &output_path {
+                                    match write_single_file(&bytes, p, &r.label, multi) {
+                                        Ok(dest) => (None, Some(dest)),
+                                        Err(e) => {
+                                            write_err.get_or_insert(e);
+                                            (Some(Bytes::from(bytes)), None)
+                                        }
+                                    }
+                                } else {
+                                    (Some(Bytes::from(bytes)), None)
+                                }
+                            }
+                            crate::job::RungArtifact::HlsRendition { .. } => (None, None),
+                        };
+                        arts.push(ArtifactEntry {
+                            label: r.label,
+                            width: r.width,
+                            height: r.height,
+                            frames: r.frames,
+                            bytes: r.bytes,
+                            data,
+                            output_path: written,
+                        });
+                    }
                 }
-                if let Some(m) = out.master_playlist {
+                if out.master_playlist.is_some() {
                     *handle.master_playlist.lock().unwrap() =
                         Some(format!("/v1/jobs/{}/files/master.m3u8", handle.id));
-                    let _ = m;
                 }
-                handle.set_phase(Phase::Completed);
+                if let Some(e) = write_err {
+                    *handle.error.lock().unwrap() = Some(e);
+                    handle.set_phase(Phase::Failed);
+                } else {
+                    handle.set_phase(Phase::Completed);
+                }
             }
             Err(e) => {
                 *handle.error.lock().unwrap() = Some(format!("{e:#}"));
@@ -461,7 +699,7 @@ fn run_job_task(
             }
         }
         // Keep the HLS tempdir alive for the process lifetime so /files works.
-        if let Some(d) = tmp {
+        if let Some(d) = tmp_guard {
             std::mem::forget(d);
         }
     }
@@ -623,11 +861,16 @@ pub fn openapi_spec() -> Value {
             "/v1/transcode": {
                 "post": {
                     "tags": ["jobs"],
-                    "summary": "Submit a transcode job (media body + spec query params)",
-                    "description": "The request body is the raw media bytes; the output \
-                                    spec comes from query parameters (mirroring the CLI). \
-                                    Returns 202 + a job id and runs asynchronously, unless \
-                                    sync=true, which blocks and streams a single-file MP4.",
+                    "summary": "Submit a transcode job (structured JSON body or streamed media)",
+                    "description": "Two ways to submit. (1) `application/json`: a structured \
+                                    TranscodeRequest — input from a server file `path` or inline \
+                                    `base64`, an optional server `output.path`, and a structured \
+                                    `spec`. No media upload required. (2) a streamed binary body \
+                                    (`application/octet-stream`): the raw media bytes, with the \
+                                    spec in the query parameters below. Either way: returns 202 + \
+                                    a job id and runs asynchronously, unless sync=true, which \
+                                    blocks and returns the MP4 (or a JSON summary when written to \
+                                    a path). Query params apply to the binary form only.",
                     "parameters": [
                         qp("mode", "string", "single (default) or hls"),
                         qp("rungs", "string", "Comma-separated WxH, e.g. 1280x720,640x360. Omit for source resolution."),
@@ -645,6 +888,7 @@ pub fn openapi_spec() -> Value {
                         qp("sync", "boolean", "Block and return the artifact directly.")
                     ],
                     "requestBody": { "required": true, "content": {
+                        "application/json": { "schema": { "$ref": "#/components/schemas/TranscodeRequest" } },
                         "application/octet-stream": { "schema": { "type": "string", "format": "binary" } }
                     } },
                     "responses": {
@@ -708,6 +952,49 @@ pub fn openapi_spec() -> Value {
                     "job_id": { "type": "string", "format": "uuid" },
                     "status": { "type": "string", "example": "queued" }
                 } },
+                "TranscodeRequest": {
+                    "type": "object", "required": ["input"],
+                    "description": "Structured JSON transcode request (application/json).",
+                    "properties": {
+                        "input": { "$ref": "#/components/schemas/InputSource" },
+                        "output": { "$ref": "#/components/schemas/OutputTarget" },
+                        "spec": { "$ref": "#/components/schemas/SpecBody" },
+                        "sync": { "type": "boolean", "description": "Block until done and return the result/summary." }
+                    }
+                },
+                "InputSource": {
+                    "type": "object",
+                    "description": "Media source — set exactly one of path / base64.",
+                    "properties": {
+                        "path": { "type": "string", "description": "Server-side file path to read the media from." },
+                        "base64": { "type": "string", "description": "The media inline, base64-encoded." }
+                    }
+                },
+                "OutputTarget": {
+                    "type": "object", "required": ["path"],
+                    "properties": {
+                        "path": { "type": "string", "description": "Server path to write the result (file for single-file single-rung; directory for multi-rung/HLS)." }
+                    }
+                },
+                "SpecBody": {
+                    "type": "object",
+                    "description": "Structured output spec (the JSON form of the query params).",
+                    "properties": {
+                        "mode": { "type": "string", "enum": ["single", "hls"] },
+                        "rungs": { "type": "array", "items": { "type": "string", "example": "1280x720" } },
+                        "ladder": { "type": "boolean" },
+                        "max_short_side": { "type": "integer" },
+                        "segment_seconds": { "type": "number" },
+                        "crf": { "type": "integer" },
+                        "speed": { "type": "integer" },
+                        "audio": { "type": "string", "enum": ["auto", "opus", "drop"] },
+                        "color": { "type": "string", "enum": ["sdr", "hdr10", "hlg", "passthrough"] },
+                        "bit_depth": { "type": "string", "enum": ["auto", "8bit", "10bit"] },
+                        "seam": { "type": "string", "enum": ["parallel", "constqp", "serial"] },
+                        "max_fps": { "type": "number" },
+                        "gpu": { "type": "integer" }
+                    }
+                },
                 "Health": { "type": "object", "properties": {
                     "status": { "type": "string", "example": "ok" },
                     "service": { "type": "string", "example": "rivet" },
@@ -821,17 +1108,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_spec_defaults_to_single_source_resolution() {
+    fn query_params_into_settings_defaults() {
         let p = TranscodeParams::default();
-        let spec = build_spec(&p, 1280, 720).unwrap();
+        let spec = p.into_settings().unwrap().into_spec(1280, 720).unwrap();
         assert!(matches!(spec.mode, crate::spec::OutputMode::SingleFile));
         assert_eq!(spec.rungs.len(), 1);
         assert_eq!((spec.rungs[0].width, spec.rungs[0].height), (1280, 720));
-        assert_eq!(spec.color, ColorPolicy::TonemapToSdr);
     }
 
     #[test]
-    fn build_spec_parses_explicit_rungs_and_hls() {
+    fn query_params_explicit_rungs_and_hls() {
         let p = TranscodeParams {
             mode: Some("hls".into()),
             rungs: Some("1920x1080, 1280x720,640x360".into()),
@@ -839,40 +1125,50 @@ mod tests {
             crf: Some(28),
             ..Default::default()
         };
-        let spec = build_spec(&p, 1920, 1080).unwrap();
+        let spec = p.into_settings().unwrap().into_spec(1920, 1080).unwrap();
         assert!(matches!(spec.mode, crate::spec::OutputMode::Hls { .. }));
         assert_eq!(spec.rungs.len(), 3);
         assert_eq!(spec.rungs[1].quality.crf, Some(28));
     }
 
     #[test]
-    fn build_spec_maps_color_pixel_audio_gpu() {
-        let p = TranscodeParams {
-            color: Some("passthrough".into()),
-            pixel_format: Some("10bit".into()),
-            audio: Some("drop".into()),
-            gpu: Some(1),
-            ..Default::default()
-        };
-        // 10-bit/passthrough only validates on a 10-bit-capable build; build the
-        // spec without validate() by checking the field mapping directly.
-        let quality = Quality::default();
-        let rungs = vec![Rung::new(640, 360).with_quality(quality)];
-        let mut spec = OutputSpec::single_file(rungs);
-        spec.audio = AudioPolicy::Drop;
-        spec.color = ColorPolicy::Passthrough;
-        spec.bit_depth = BitDepth::TenBit;
-        spec = spec.with_gpu_index(1);
-        let _ = &p;
-        assert_eq!(spec.color, ColorPolicy::Passthrough);
-        assert_eq!(spec.bit_depth, BitDepth::TenBit);
-        assert_eq!(spec.audio, AudioPolicy::Drop);
-        assert_eq!(spec.gpu_index, Some(1));
+    fn json_spec_body_into_params_and_settings() {
+        // The JSON body uses an array of rungs + a structured spec; it lands on
+        // the same TranscodeSettings as the query string.
+        let body = serde_json::json!({
+            "mode": "hls",
+            "rungs": ["1280x720", "640x360"],
+            "crf": 30,
+            "audio": "opus",
+            "pixel_format": "auto"
+        });
+        let sb: SpecBody = serde_json::from_value(body).unwrap();
+        let s = sb.into_params().into_settings().unwrap();
+        assert_eq!(s.mode, Some(crate::settings::Mode::Hls));
+        assert_eq!(s.rungs, vec![(1280, 720), (640, 360)]);
+        assert_eq!(s.crf, Some(30));
+        assert_eq!(s.audio, Some(crate::spec::AudioPolicy::ForceOpus));
     }
 
     #[test]
-    fn parse_rungs_rejects_garbage() {
-        assert!(parse_rungs("notarung", &Quality::default()).is_err());
-        assert!(parse_rungs("1280x720", &Quality::default()).is_ok());
+    fn query_params_reject_bad_values() {
+        let bad = TranscodeParams {
+            color: Some("ultrahd".into()),
+            ..Default::default()
+        };
+        assert!(bad.into_settings().is_err());
+        let bad_rung = TranscodeParams {
+            rungs: Some("notarung".into()),
+            ..Default::default()
+        };
+        assert!(bad_rung.into_settings().is_err());
+    }
+
+    #[test]
+    fn base64_roundtrip() {
+        // "rivet" → cml2ZXQ=
+        assert_eq!(base64_decode("cml2ZXQ=").unwrap(), b"rivet");
+        assert_eq!(base64_decode("").unwrap(), b"");
+        assert!(base64_decode("not valid !!!").is_err());
     }
 }

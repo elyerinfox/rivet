@@ -68,3 +68,8 @@ thumbnail = ["dep:ravif", "dep:rgb"]
 # rivet to transcode over the network. Pairs naturally with the hardware
 # encode features (e.g. `--features server,nvidia`).
 server = ["dep:axum", "dep:serde", "dep:serde_json", "dep:uuid", "tokio/net"]
+# `rivet ipc`: a Unix-domain-socket server so a long-running app can stream
+# media in and out without HTTP or temp files. Opt-in (Unix only at runtime; on
+# Windows the command exists but reports use `pipe`/`serve`). The `pipe`
+# stdin/stdout streaming path is always available and needs no feature.
+ipc = []

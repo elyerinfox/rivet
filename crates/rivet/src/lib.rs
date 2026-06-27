@@ -53,6 +53,7 @@ pub mod rung_scaler;
 /// HTTP transcode API (opt-in `server` feature).
 #[cfg(feature = "server")]
 pub mod server;
+pub mod settings;
 pub mod spec;
 #[cfg(feature = "thumbnail")]
 pub mod thumbnail;
@@ -71,6 +72,7 @@ pub use ladder::standard_ladder;
 pub use multigpu::{MultiGpuParams, RungManifest, detect_gpu_pool, run_multigpu_hls};
 pub use probe::{AudioStreamInfo, MediaInfo, probe_bytes, probe_file};
 pub use progress::{JobEvent, ProgressSink, RungProgress, RungStatus, channel_sink, fn_sink};
+pub use settings::{Mode, TranscodeSettings};
 pub use spec::{
     AudioPolicy, BitDepth, ColorPolicy, Container, EncodePolicy, GpuFamily, Muxer, OutputMode,
     OutputSpec, Quality, Rung, VideoCodec,
