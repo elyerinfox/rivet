@@ -60,6 +60,12 @@ use super::{AUTO_FROM_TARGET, EncodedPacket, Encoder, EncoderConfig};
 #[cfg(test)]
 use crate::frame::ColorMetadata;
 use crate::frame::{PixelFormat, TransferFn, VideoFrame};
+// Shared mfx struct layouts live in one place (`qsv_ffi`) so encode + decode
+// can't drift apart on layout again.
+use crate::qsv_ffi::{
+    MfxBitstream, MfxExtBuffer, MfxFrameData, MfxFrameInfo, MfxFrameSurface1, MfxInfoMfx,
+    MfxVersion, MfxVideoParam,
+};
 
 // ─── oneVPL ABI constants ─────────────────────────────────────────
 // See vendor/intel/ for authoritative definitions.
@@ -142,127 +148,12 @@ const RING_SIZE: usize = 4;
 
 // ─── Struct layouts ───────────────────────────────────────────────
 //
-// Match the oneVPL 2.10 upstream ABI. Trimmed to named fields we
-// reference plus a reserved tail sized so the total struct footprint
-// equals upstream. Verified by `const_assert!`s at the bottom.
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MfxVersion {
-    minor: u16,
-    major: u16,
-}
-
-/// oneVPL `mfxFrameInfo` — **68 bytes**, verified by `offsetof` against the
-/// installed oneVPL 2.16 headers on an Arc box: reserved[4], ChannelId,
-/// BitDepthLuma/Chroma (u16 @18/20), Shift @22, FrameId @24 (8B), FourCC @32,
-/// Width @36 (adjacent — no union pad), FrameRateExtN @48, PicStruct @62.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MfxFrameInfo {
-    reserved: [u32; 4],
-    channel_id: u16,
-    bit_depth_luma: u16,
-    bit_depth_chroma: u16,
-    shift: u16,
-    frame_id: [u16; 4], // mfxFrameId — 8 bytes, 2-aligned (NOT u64; keeps size 68)
-    fourcc: u32,
-    width: u16,
-    height: u16,
-    crop_x: u16,
-    crop_y: u16,
-    crop_w: u16,
-    crop_h: u16,
-    frame_rate_ext_n: u32,
-    frame_rate_ext_d: u32,
-    reserved3: u16,
-    aspect_ratio_w: u16,
-    aspect_ratio_h: u16,
-    pic_struct: u16,
-    chroma_format: u16,
-    reserved2: u16,
-}
-
-/// oneVPL `mfxInfoMFX` — 256 bytes per vendor/intel/mfxstructs.h:54-101.
-///
-/// The three CQP/VBR/ICQ union arms all start at the same offset;
-/// field aliasing is tracked by the `qpi_or_delay` / `qpp_or_kbps_or_icq`
-/// / `qpb_or_maxkbps` field names. See `rate_slots_for_rc` for the
-/// slot-to-concept mapping.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MfxInfoMfx {
-    // mfxInfoMFX: reserved[7] (28B), then LowPower (u16), BRCParamMultiplier
-    // (u16), then FrameInfo at offset 32. The old layout used reserved[6] +
-    // low_power:u32, which put `low_power` in a reserved slot (offset 24) and
-    // left the real LowPower (offset 28) at 0 — so AV1 on Arc (low-power-only)
-    // got LowPower=UNKNOWN and Query rejected it.
-    reserved: [u32; 7],
-    low_power: u16,
-    brc_param_multiplier: u16,
-    frame_info: MfxFrameInfo,
-    codec_id: u32,
-    codec_profile: u16,
-    codec_level: u16,
-    num_thread: u16,
-
-    target_usage: u16,
-    gop_pic_size: u16,
-    gop_ref_dist: u16,
-    gop_opt_flag: u16,
-    idr_interval: u16,
-
-    rate_control_method: u16,
-    /// Slot 0 of the rc-union. Per vendor/intel/mfxstructs.h:74-78:
-    /// `InitialDelayInKB` (CBR/VBR) / `QPI` (CQP) / `Accuracy` (AVBR).
-    /// **ICQQuality does NOT live here** — it's slot 1.
-    qpi_or_delay: u16,
-    buffer_size_kb: u16,
-    /// Slot 1 of the rc-union. Per vendor/intel/mfxstructs.h:80-84:
-    /// `TargetKbps` (CBR/VBR) / `QPP` (CQP) / **`ICQQuality` (ICQ)**.
-    /// This is where AV1 ICQ quality lands in oneVPL 2.10.
-    qpp_or_kbps_or_icq: u16,
-    /// Slot 2 of the rc-union. Per vendor/intel/mfxstructs.h:85-89:
-    /// `MaxKbps` (CBR/VBR) / `QPB` (CQP) / `Convergence` (AVBR).
-    qpb_or_maxkbps: u16,
-
-    num_slice: u16,
-    num_ref_frame: u16,
-    encoded_order: u16,
-    // No tail: real mfxInfoMFX is 136 bytes (FrameInfo @32 is 68B, CodecId @100,
-    // RateControlMethod @120, EncodedOrder @134). The old `_tail[27]` padded it
-    // to a bogus 256 (from a wrong vendored header).
-}
-
-/// oneVPL `mfxVideoParam` — **208 bytes**, verified by `offsetof`: AllocId @0,
-/// the mfxInfoMFX/mfxInfoVPP union @16 (**168 bytes** — mfxInfoVPP is larger than
-/// mfxInfoMFX's 136, so 32 bytes of union padding follow `mfx`), Protected @184,
-/// IOPattern @186, ExtParam @192, NumExtParam @200.
-#[repr(C)]
-struct MfxVideoParam {
-    alloc_id: u32,
-    reserved: [u32; 2],
-    reserved3: u16,
-    async_depth: u16,
-    mfx: MfxInfoMfx,
-    // mfx occupies the 168-byte union (mfxInfoVPP > mfxInfoMFX=136); pad the
-    // remaining 32 bytes so Protected/IOPattern/ExtParam land at the right offset.
-    _mfx_union_pad: [u8; 32],
-    protected: u16,
-    io_pattern: u16,
-    // repr(C) inserts 4 bytes of padding here to 8-align the pointer.
-    ext_param: *mut *mut MfxExtBuffer,
-    num_ext_param: u16,
-    reserved2: u16,
-}
-
-/// oneVPL `mfxExtBuffer` — every ExtParam entry starts with this 8-byte
-/// header. vendor/intel/mfxstructs.h:121-124.
-#[repr(C)]
-struct MfxExtBuffer {
-    buffer_id: u32,
-    buffer_sz: u32,
-}
+// The shared mfx structs (MfxVersion / MfxFrameInfo / MfxInfoMfx /
+// MfxVideoParam / MfxExtBuffer / MfxFrameData / MfxFrameSurface1 /
+// MfxBitstream) are imported from `crate::qsv_ffi` — one offsetof-verified
+// definition for both encode and decode. The encode-only ext-buffer structs
+// (tile param / coding option3 / video signal info) and mfxEncodeCtrl stay
+// below.
 
 /// oneVPL `mfxExtAV1TileParam` — 136 bytes per vendor/intel/mfxstructs.h:135-141.
 /// Header (8) + 3 × u16 (6) + reserved[61] (122) = 136.
@@ -336,53 +227,7 @@ struct MfxExtVideoSignalInfo {
     matrix_coefficients: u16,         /* H.273 §8.3 */
 }
 
-/// oneVPL `mfxFrameData` — **96 bytes**, offsetof-verified: the Y/U/V plane
-/// pointers live at @48/@56/@64, NOT at the start. The old layout put Y at @0
-/// (the ExtParam slot), so every surface upload scribbled the wrong field.
-#[repr(C)]
-struct MfxFrameData {
-    ext_param_or_reserved2: u64, // @0 (union: mfxExtBuffer** / reserved2)
-    num_ext_param: u16,          // @8
-    reserved: [u16; 9],          // @10
-    mem_type: u16,               // @28
-    pitch_high: u16,             // @30
-    time_stamp: u64,             // @32
-    frame_order: u32,            // @40
-    locked: u16,                 // @44
-    pitch: u16,                  // @46 (PitchLow)
-    y: *mut u8,                  // @48
-    u: *mut u8,                  // @56 (UV for NV12/P010)
-    v: *mut u8,                  // @64
-    a: *mut u8,                  // @72
-    mem_id: *mut c_void,         // @80
-    corrupted: u16,              // @88
-    data_flag: u16,              // @90
-}
-
-/// oneVPL `mfxFrameSurface1` — 256-byte struct per upstream layout.
-/// vendor/intel/mfxstructs.h:163-167.
-#[repr(C)]
-struct MfxFrameSurface1 {
-    reserved: [u32; 4],
-    info: MfxFrameInfo,
-    data: MfxFrameData,
-}
-
-/// oneVPL `mfxBitstream` — vendor/intel/mfxstructs.h:171-183.
-#[repr(C)]
-struct MfxBitstream {
-    reserved: [u32; 6],
-    decode_time_stamp: i64,
-    time_stamp: u64,
-    data: *mut u8,
-    data_offset: u32,
-    data_length: u32,
-    max_length: u32,
-    pic_struct: u16,
-    frame_type: u16,
-    data_flag: u16,
-    reserved2: u16,
-}
+// (MfxFrameData / MfxFrameSurface1 / MfxBitstream are imported from qsv_ffi.)
 
 /// oneVPL `mfxEncodeCtrl` — optional per-frame control passed to
 /// `EncodeFrameAsync`. We never populate it (pass `NULL`), but the
@@ -1732,24 +1577,19 @@ where
 // cited against the vendored headers.
 
 // mfxVersion — 2 × u16 = 4 bytes. vendor/intel/mfxstructs.h:191-193.
-const _: () = assert!(std::mem::size_of::<MfxVersion>() == 4);
 
 // mfxFrameInfo — 80 bytes. vendor/intel/mfxstructs.h:20-50.
-const _: () = assert!(std::mem::size_of::<MfxFrameInfo>() == 68);
 
 // mfxInfoMFX — 256 bytes per upstream (the union of rc-arms is 26
 // bytes; reserved tail fills the remainder to 256). Rust struct has
 // the union flattened, so pad is `[u32; 27]` and the field preamble
 // adds up identically to the upstream layout.
 // vendor/intel/mfxstructs.h:54-101.
-const _: () = assert!(std::mem::size_of::<MfxInfoMfx>() == 136);
 
 // mfxVideoParam — 304 bytes on 64-bit per upstream.
 // vendor/intel/mfxstructs.h:103-117.
-const _: () = assert!(std::mem::size_of::<MfxVideoParam>() == 208);
 
 // mfxExtBuffer — 8 bytes (u32 + u32). vendor/intel/mfxstructs.h:121-124.
-const _: () = assert!(std::mem::size_of::<MfxExtBuffer>() == 8);
 
 // mfxExtAV1TileParam — 136 bytes. Header(8) + 3×u16(6) + reserved[61](122).
 // vendor/intel/mfxstructs.h:135-141.
@@ -1760,16 +1600,13 @@ const _: () = assert!(std::mem::size_of::<MfxExtAv1TileParam>() == 24);
 //   reserved[4](8) + u16(2) + u16(2) = 66, rounded up to 72 to respect
 //   the 8-byte alignment set by the pointer fields at the struct head.
 // vendor/intel/mfxstructs.h:145-161.
-const _: () = assert!(std::mem::size_of::<MfxFrameData>() == 96);
 
 // mfxFrameSurface1 — reserved[4](16) + mfxFrameInfo(80) +
 // mfxFrameData(72) = 168 bytes. vendor/intel/mfxstructs.h:163-167.
-const _: () = assert!(std::mem::size_of::<MfxFrameSurface1>() == 184);
 
 // mfxBitstream — reserved[6](24) + i64(8) + u64(8) + ptr(8) + 3×u32(12)
 // + 4×u16(8) = 68 rounded up to 72 bytes via trailing alignment pad.
 // vendor/intel/mfxstructs.h:171-183.
-const _: () = assert!(std::mem::size_of::<MfxBitstream>() == 72);
 
 // mfxEncodeCtrl — 88 bytes on 64-bit for our trimmed Rust mirror.
 // Upstream oneVPL 2.10 mfxEncodeCtrl is larger (carries additional
