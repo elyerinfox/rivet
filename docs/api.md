@@ -29,12 +29,22 @@ locally. An airgapped deployment can vendor the JS.)
 
 - **Submit → poll → fetch.** `POST /v1/transcode` returns `202 { job_id }` and
   runs asynchronously. Poll `GET /v1/jobs/{id}` for status + per-rung progress,
-  then download the artifact(s). Pass `?sync=true` to block and get a
-  single-file MP4 back in one call.
-- **The output spec is query params** on `/v1/transcode`, mirroring the CLI
-  flags exactly (see [the table](#transcode-query-parameters)).
-- **The media is the request body** (`application/octet-stream`) — raw bytes,
-  up to a 4 GiB ceiling.
+  then download the artifact(s). Pass `sync: true` (or `?sync=true`) to block and
+  get the result in one call.
+- **Two request shapes** (pick whichever fits):
+  - **Structured JSON body** (`Content-Type: application/json`) — a
+    [`TranscodeRequest`](#json-body): `input` from a server **file path** or inline
+    **base64**, an optional server **`output.path`**, and a structured **`spec`**.
+    Streaming the media is *not* required.
+  - **Streamed binary body** (`application/octet-stream`) — the raw media bytes
+    (up to 4 GiB), with the output spec in the **query params**
+    ([table](#transcode-query-parameters)). This is the streaming option.
+- **Server-side file I/O.** When the JSON body names an input/output `path`, the
+  server reads/writes its own filesystem (no upload/download). Set
+  `RIVET_FILE_ROOT` to sandbox those paths to a directory; otherwise any path is
+  allowed (the server binds localhost by default — treat it as trusted-local).
+- The output spec — JSON `spec`, query params, the CLI flags, and the IPC
+  `key=value` header — are all the same canonical knob set, so they map 1:1.
 
 ---
 
@@ -73,8 +83,34 @@ curl -s -X POST --data-binary @input.mkv http://localhost:8080/v1/probe
 
 ### `POST /v1/transcode`
 
-Body = media bytes; output spec = query params. Returns `202 { job_id, status }`
-and runs asynchronously (or, with `?sync=true`, blocks and returns the MP4).
+Returns `202 { job_id, status }` and runs asynchronously (or, with `sync`, blocks
+and returns the MP4 — or a JSON summary when written to a path).
+
+<a id="json-body"></a>
+**JSON body** (`application/json`) — point at a server file, no upload:
+
+```sh
+curl -s -X POST http://localhost:8080/v1/transcode \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "input":  { "path": "/data/in.mkv" },
+        "output": { "path": "/data/out.mp4" },
+        "spec":   { "mode": "single", "rungs": ["1280x720"], "crf": 28, "color": "sdr" },
+        "sync":   true
+      }'
+```
+
+Body fields:
+
+| Field | Notes |
+|-------|-------|
+| `input.path` | a file path **on the server** to read the media from |
+| `input.base64` | …or the media inline, base64-encoded (set exactly one of path/base64) |
+| `output.path` | optional: write the result to a server path (a file for single-rung single-file; a directory for multi-rung / HLS). Omit to keep it in memory / stream it back |
+| `spec` | the structured output spec — same fields as the query params below (`mode`, `rungs` as an array, `crf`, `audio`, `color`, `bit_depth`, `seam`, …) |
+| `sync` | block until done; returns the MP4 (no `output.path`) or a JSON summary |
+
+**Binary body** (`application/octet-stream`) — stream the media, spec in the query:
 
 ```sh
 job=$(curl -s --data-binary @input.mkv \

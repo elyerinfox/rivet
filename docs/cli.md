@@ -232,11 +232,14 @@ Single MP4 only — for an HLS package or a multi-rung ladder use
 ## `rivet ipc`
 
 ```
+cargo build --release --features ipc   # opt-in; the subcommand only exists in an ipc build
 rivet ipc --socket <PATH>
 ```
 
-Run a **Unix-domain-socket** server (Unix only) so a long-running application can
-stream jobs in and out without spawning a process per file or going through HTTP.
+Run a **Unix-domain-socket** server (opt-in `ipc` feature; Unix only at runtime)
+so a long-running application can stream jobs in and out without spawning a
+process per file or going through HTTP. `rivet pipe` (stdin/stdout streaming) is
+always available and needs no feature.
 Bind a socket, then for **each connection**: the client optionally writes a
 **settings header line**, then the input media, **half-closes** its write side
 (signals end-of-input), and reads the transcoded AV1/MP4 back until EOF. One
@@ -245,10 +248,12 @@ so concurrent clients simply queue.
 
 **Settings header** (optional): if the stream begins with `#rivet`, the first
 line is parsed as space-separated `key=value` settings and stripped before
-decode; the keys mirror the `pipe` flags
-(`crf` `speed` `audio` `color` `bit-depth` `max-fps` `width` `height` `gpu`).
-Real container magic bytes never start with `#rivet`, so a raw media stream
-without a header just gets the defaults.
+decode. The keys are the shared `TranscodeSettings` vocabulary — the same names
+as the CLI flags (`crf` `speed` `audio` `color` `bit-depth` `max-fps` `width`
+`height` `gpu` `gpu-family` `single-gpu` `decode-gpu` `seam`). Real container
+magic bytes never start with `#rivet`, so a raw media stream without a header
+just gets the defaults. (A single socket connection produces one MP4, so
+`mode=hls`/multi-rung isn't supported here — use the HTTP API for that.)
 
 ```
 #rivet crf=28 color=hdr10 width=1280 height=720\n

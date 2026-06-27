@@ -710,17 +710,17 @@ fn sync_response(handle: &Arc<JobHandle>) -> Result<Response, ApiError> {
         let msg = handle.error.lock().unwrap().clone().unwrap_or_default();
         return Err(ApiError::internal(anyhow::anyhow!(msg)));
     }
-    let arts = handle.artifacts.lock().unwrap();
-    if let Some(a) = arts.iter().find(|a| a.data.is_some()) {
-        let data = a.data.clone().unwrap();
-        return Ok((
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "video/mp4")],
-            data,
-        )
-            .into_response());
+    // Extract any in-RAM single-file bytes, then DROP the lock — `status_json()`
+    // below re-locks `artifacts`, and std `Mutex` isn't reentrant (holding it
+    // here would deadlock the handler; this is the path output.path takes).
+    let streamable = {
+        let arts = handle.artifacts.lock().unwrap();
+        arts.iter().find_map(|a| a.data.clone())
+    };
+    if let Some(data) = streamable {
+        return Ok((StatusCode::OK, [(header::CONTENT_TYPE, "video/mp4")], data).into_response());
     }
-    // Multi-rung or HLS: return the status JSON (no single artifact to stream).
+    // output.path / multi-rung / HLS: return the status JSON (paths + progress).
     Ok(Json(handle.status_json()).into_response())
 }
 
