@@ -2,7 +2,7 @@
 name = "rivet"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Modular GPU-accelerated video transcoding library and CLI (AV1 + Opus, MP4/CMAF-HLS)."

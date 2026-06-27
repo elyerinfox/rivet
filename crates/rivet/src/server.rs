@@ -826,7 +826,7 @@ pub fn openapi_spec() -> Value {
             "description": "HTTP API for the rivet GPU video transcoder. POST media \
                             and an output spec; rivet transcodes to AV1 (single-file \
                             MP4 or CMAF/HLS) and reports per-rung progress.",
-            "license": { "name": "Apache-2.0" }
+            "license": { "name": "Open Encoding Attribution License v1.0", "url": "https://github.com/elyerinfox/rivet/blob/develop/LICENSE.md" }
         },
         "servers": [ { "url": "/", "description": "this server" } ],
         "tags": [

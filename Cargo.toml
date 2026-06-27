@@ -14,7 +14,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+# Custom source-available license (not a standard SPDX id), so use license-file.
+license-file = "LICENSE.md"
 repository = "https://github.com/elyerinfox/rivet"
 authors = ["Ely Erin Fox"]
 
