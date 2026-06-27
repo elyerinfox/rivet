@@ -36,3 +36,16 @@ jobs:
     width: 1280
     height: 720
     color: hdr10
+
+  # 5) video filters as structured objects (crop centred, mirror, rotate).
+  #    Equivalent string form: filter: "crop=1280:720,hflip,rotate=90"
+  - input: in/phone_clip.mov
+    output: out/phone_fixed.mp4
+    width: 720
+    height: 1280
+    filter:
+      - crop:
+          w: 1280
+          h: 720           # x/y optional → centred
+      - hflip
+      - rotate: 90

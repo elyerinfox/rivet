@@ -77,8 +77,10 @@ pub struct JobSpec {
     pub decode_gpu: Option<u32>,
     pub width: Option<u32>,
     pub height: Option<u32>,
-    /// Video filter chain, e.g. `crop=1280:720,hflip` (applied before scaling).
-    pub filter: Option<String>,
+    /// Video filters applied before scaling. Either a chain string
+    /// (`"crop=1280:720,hflip"`) or a structured list of objects
+    /// (`[{crop: {w: 1280, h: 720}}, hflip]`). See [`codec::filter::FilterSpec`].
+    pub filter: Option<codec::filter::FilterSpec>,
 }
 
 impl JobSpec {
@@ -153,7 +155,9 @@ impl JobSpec {
         s.decode_gpu = self.decode_gpu;
         s.width = self.width;
         s.height = self.height;
-        s.filter = self.filter.clone();
+        if let Some(f) = &self.filter {
+            s.filters = f.resolve().context("resolving filter")?;
+        }
         Ok(s)
     }
 }
@@ -559,6 +563,23 @@ jobs:
     fn unknown_field_is_rejected() {
         let bad = "jobs:\n  - input: a.mkv\n    crff: 24\n";
         assert!(parse_manifest(bad, Format::Yaml).is_err());
+    }
+
+    #[test]
+    fn filter_structured_objects_and_string_resolve_equal() {
+        use codec::filter::VideoFilter::{Crop, HFlip, Rotate};
+        let expect = vec![Crop { w: 1280, h: 720, x: None, y: None }, HFlip, Rotate(90)];
+        // structured object list (the DSL benefit) — block-style YAML
+        let structured = "jobs:\n  - input: a.mkv\n    output: a.mp4\n    filter:\n      - crop:\n          w: 1280\n          h: 720\n      - hflip\n      - rotate: 90\n";
+        let s = parse_manifest(structured, Format::Yaml).unwrap().jobs[0].to_settings().unwrap();
+        assert_eq!(s.filters, expect);
+        // the equivalent chain string (interop) resolves identically
+        let string = "jobs:\n  - input: a.mkv\n    output: a.mp4\n    filter: \"crop=1280:720,hflip,rotate=90\"\n";
+        let s2 = parse_manifest(string, Format::Yaml).unwrap().jobs[0].to_settings().unwrap();
+        assert_eq!(s2.filters, expect);
+        // a bogus structured filter is rejected
+        let bad = "jobs:\n  - input: a.mkv\n    filter:\n      - rotate: 45\n";
+        assert!(parse_manifest(bad, Format::Yaml).unwrap().jobs[0].to_settings().is_err());
     }
 
     #[test]

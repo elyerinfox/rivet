@@ -50,9 +50,10 @@ pub struct TranscodeSettings {
     /// when neither `rungs` nor `ladder` is set; defaults to the source size.
     pub width: Option<u32>,
     pub height: Option<u32>,
-    /// Video filter chain string (ffmpeg-`-vf`-style), e.g. `crop=1280:720,hflip`.
-    /// Parsed into `codec::filter::VideoFilter`s applied before per-rung scaling.
-    pub filter: Option<String>,
+    /// Video filter chain (crop/pad/flip/rotate/grayscale) applied before
+    /// per-rung scaling. The canonical structured form; string surfaces parse
+    /// `codec::filter::parse_chain` at the edge.
+    pub filters: Vec<codec::filter::VideoFilter>,
 }
 
 impl TranscodeSettings {
@@ -119,9 +120,7 @@ impl TranscodeSettings {
             spec.encode_policy(EncodePolicy::AllGpus)
         };
         spec = spec.decode_gpu(self.decode_gpu);
-        if let Some(f) = &self.filter {
-            spec = spec.with_filters(codec::filter::parse_chain(f).context("parsing filter chain")?);
-        }
+        spec = spec.with_filters(self.filters);
 
         spec.validate().context("invalid output spec")?;
         Ok(spec)
@@ -153,7 +152,7 @@ impl TranscodeSettings {
             "decode-gpu" => self.decode_gpu = Some(val.parse().context("decode-gpu")?),
             "width" => self.width = Some(val.parse().context("width")?),
             "height" => self.height = Some(val.parse().context("height")?),
-            "filter" => self.filter = Some(val.to_string()),
+            "filter" => self.filters = codec::filter::parse_chain(val)?,
             o => bail!(
                 "unknown setting '{o}' (mode/rung/ladder/crf/speed/audio/color/bit-depth/seam/max-fps/gpu/gpu-family/single-gpu/decode-gpu/width/height/filter)"
             ),
@@ -192,7 +191,7 @@ impl TranscodeSettings {
             && self.decode_gpu.is_none()
             && self.width.is_none()
             && self.height.is_none()
-            && self.filter.is_none()
+            && self.filters.is_empty()
     }
 }
 

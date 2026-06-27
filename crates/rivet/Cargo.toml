@@ -70,7 +70,7 @@ thumbnail = ["dep:ravif", "dep:rgb"]
 # an output spec and runs transcode jobs, so another application can signal
 # rivet to transcode over the network. Pairs naturally with the hardware
 # encode features (e.g. `--features server,nvidia`).
-server = ["dep:axum", "dep:serde", "dep:serde_json", "dep:uuid", "tokio/net"]
+server = ["dep:axum", "dep:serde", "dep:serde_json", "dep:uuid", "tokio/net", "codec/serde"]
 # `rivet ipc`: a Unix-domain-socket server so a long-running app can stream
 # media in and out without HTTP or temp files. Opt-in (Unix only at runtime; on
 # Windows the command exists but reports use `pipe`/`serve`). The `pipe`
@@ -78,4 +78,4 @@ server = ["dep:axum", "dep:serde", "dep:serde_json", "dep:uuid", "tokio/net"]
 ipc = []
 # `rivet batch`: a YAML/JSON manifest DSL for converting many files in one run.
 # Pulls serde + a YAML/JSON parser + glob. See docs/batch.md.
-batch = ["dep:serde", "dep:serde_json", "dep:serde_yaml_ng", "dep:glob"]
+batch = ["dep:serde", "dep:serde_json", "dep:serde_yaml_ng", "dep:glob", "codec/serde"]

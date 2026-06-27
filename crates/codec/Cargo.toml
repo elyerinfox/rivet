@@ -17,6 +17,12 @@ name = "codec"
 # No ffmpeg build prerequisites. Everything ships from cargo.
 default = []
 
+# `serde`: derive Serialize/Deserialize on the public value types that make
+# sense to (de)serialize — currently `filter::VideoFilter` + `FilterSpec`, so a
+# YAML/JSON DSL can express a filter chain as structured objects. Off by
+# default (keeps the low-level crate lean); rivet's `batch`/`server` enable it.
+serde = ["dep:serde"]
+
 # `ffmpeg`: activates the ffmpeg-next primary decoder. Brings the
 # full libavcodec catalogue (H.264 / H.265 / VP8 / VP9 / AV1 / MPEG-2 /
 # MPEG-4 / ProRes / …) + Vulkan / NVDEC / D3D11 / VAAPI hwaccel
@@ -80,6 +86,7 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
+serde = { version = "1", features = ["derive"], optional = true }
 libloading.workspace = true
 
 # mp4 crate is still needed by the container demuxer side; the codec
@@ -139,6 +146,7 @@ nvml-wrapper = { workspace = true }
 container = { path = "../container", package = "rivet-container" }
 criterion = { workspace = true }
 tracing-subscriber = { workspace = true }
+serde_json = "1"
 
 [[bench]]
 name = "colorspace"

@@ -23,6 +23,17 @@
       "width": 1280,
       "height": 720,
       "color": "hdr10"
+    },
+    {
+      "input": "in/phone_clip.mov",
+      "output": "out/phone_fixed.mp4",
+      "width": 720,
+      "height": 1280,
+      "filter": [
+        { "crop": { "w": 1280, "h": 720 } },
+        "hflip",
+        { "rotate": 90 }
+      ]
     }
   ]
 }

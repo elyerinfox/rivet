@@ -100,7 +100,25 @@ like `crff: 24` fails loudly instead of being silently ignored.
 | `single_gpu` | bool | Use one GPU (serial). |
 | `decode_gpu` | int | Pin the decode pump to a GPU. |
 | `width`, `height` | int | Scale a single-rung output (ignored when `rungs`/`ladder` is set). |
-| `filter` | string | Video filter chain, e.g. `crop=1280:720,hflip` — see [output-spec § Video filters](output-spec.md#video-filters--with_filters). |
+| `filter` | string **or** list | Video filters — a chain string `"crop=1280:720,hflip"`, or a structured list of objects (below). See [output-spec § Video filters](output-spec.md#video-filters--with_filters). |
+
+A job's `filter` accepts either a string or a list of filter objects — both
+resolve to the same thing and are validated up front:
+
+```yaml
+jobs:
+  - input: in/clip.mov
+    output: out/clip.mp4
+    filter:                      # structured objects
+      - crop:
+          w: 1920
+          h: 1080                # x/y optional → centred
+      - hflip
+      - rotate: 90
+  - input: in/other.mov
+    output: out/other.mp4
+    filter: "crop=1920:1080,hflip"   # …or the equivalent string
+```
 
 These are exactly the knobs in the [`OutputSpec` guide](output-spec.md) — read it
 for what each one does and the valid combinations. `validate()` still runs per

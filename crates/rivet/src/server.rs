@@ -308,8 +308,9 @@ struct SpecBody {
     seam: Option<String>,
     max_fps: Option<f64>,
     gpu: Option<u32>,
-    /// Video filter chain, e.g. `crop=1280:720,hflip`.
-    filter: Option<String>,
+    /// Video filters — a chain string (`"crop=1280:720,hflip"`) or a structured
+    /// list of objects (`[{"crop":{"w":1280,"h":720}},"hflip"]`).
+    filter: Option<codec::filter::FilterSpec>,
 }
 
 impl SpecBody {
@@ -328,7 +329,10 @@ impl SpecBody {
             seam: self.seam,
             max_fps: self.max_fps,
             gpu: self.gpu,
-            filter: self.filter,
+            // Collapse the structured-or-string FilterSpec to the chain string
+            // (TranscodeParams is the string-keyed query form; into_settings
+            // re-parses it). Round-trips losslessly via Display.
+            filter: self.filter.map(|f| f.to_chain()),
             sync: None,
         }
     }
@@ -460,7 +464,9 @@ impl TranscodeParams {
         }
         s.max_fps = self.max_fps;
         s.gpu = self.gpu;
-        s.filter = self.filter.clone();
+        if let Some(f) = &self.filter {
+            s.filters = codec::filter::parse_chain(f).context("parsing filter")?;
+        }
         Ok(s)
     }
 }

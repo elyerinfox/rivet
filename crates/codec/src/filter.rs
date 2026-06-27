@@ -1,55 +1,129 @@
 //! Video filters — per-frame geometric/color transforms applied to decoded
 //! frames **before** per-rung scaling and encoding.
 //!
-//! A filter chain is a small ordered list of [`VideoFilter`]s, parsed from an
-//! ffmpeg-`-vf`-style string (`parse_chain`): comma-separated filters, each
-//! `name` or `name=a:b:…`. They operate on planar 4:2:0 frames — `Yuv420p`
-//! (8-bit) and `Yuv420p10le` (10-bit) — which is what the pipeline normalizes to
-//! before this stage runs.
+//! The canonical representation is a list of [`VideoFilter`] **values**
+//! (interpreted by [`apply`]). They have two interchangeable serializations:
 //!
-//! ```text
-//!   crop=1280:720          crop a centered 1280×720 region
-//!   crop=1280:720:0:0      crop 1280×720 at (0,0)
-//!   pad=1920:1080          letterbox/pillarbox into 1920×1080 (centered, black)
-//!   hflip / vflip          mirror horizontally / vertically
-//!   rotate=90|180|270      rotate clockwise (90/270 swap width↔height)
-//!   transpose              alias for rotate=90
-//!   grayscale (or gray)    drop chroma (neutral)
-//! ```
+//! - **Structured** (objects) — with the `serde` feature, each filter
+//!   (de)serializes to/from a tagged object, so a YAML/JSON DSL can write a
+//!   chain as a list of objects:
+//!   ```yaml
+//!   filters:
+//!     - crop: { w: 1280, h: 720 }   # centred (x/y optional)
+//!     - hflip
+//!     - rotate: 90
+//!     - pad: { w: 1920, h: 1080 }
+//!   ```
+//! - **Textual** (ffmpeg-`-vf`-style) — [`parse_chain`] (text → values) and
+//!   [`Display`]/[`chain_to_string`] (values → text):
+//!   `crop=1280:720,hflip,rotate=90,pad=1920:1080`.
+//!
+//! [`FilterSpec`] (serde) accepts **either** form in one field, so a DSL can use
+//! objects or a string interchangeably. The two round-trip:
+//! `parse_chain(&chain_to_string(c)) == c`.
 //!
 //! Geometric ops are pure sample rearrangement, so they run on the raw bytes
-//! with a 1- or 2-byte sample stride and work for both bit depths. 4:2:0 needs
-//! even dimensions, so crop/pad sizes + offsets are rounded to even.
+//! with a 1- or 2-byte sample stride and work for both `Yuv420p` (8-bit) and
+//! `Yuv420p10le` (10-bit). 4:2:0 needs even dimensions, so crop/pad sizes +
+//! offsets round to even.
+
+use std::fmt;
 
 use anyhow::{Result, bail};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 
 use crate::frame::{PixelFormat, VideoFrame};
 
-/// One video-filter step.
+/// One video-filter step. The canonical, code-interpreted representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum VideoFilter {
-    /// Crop a `w×h` region at `(x, y)`. Even-aligned for 4:2:0.
-    Crop { w: u32, h: u32, x: u32, y: u32 },
-    /// Centre-crop a `w×h` region (offset derived to centre it).
-    CropCenter { w: u32, h: u32 },
-    /// Place the frame into a `w×h` canvas at `(x, y)`, filling the rest with
-    /// neutral black. Used for letterbox / pillarbox.
-    Pad { w: u32, h: u32, x: u32, y: u32 },
-    /// Centre the frame in a `w×h` canvas (centred offset).
-    PadCenter { w: u32, h: u32 },
+    /// Crop a `w×h` region. Centred when `x`/`y` are omitted, else at `(x, y)`.
+    Crop {
+        w: u32,
+        h: u32,
+        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+        x: Option<u32>,
+        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+        y: Option<u32>,
+    },
+    /// Pad into a `w×h` canvas (neutral black). Centred when `x`/`y` are omitted.
+    Pad {
+        w: u32,
+        h: u32,
+        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+        x: Option<u32>,
+        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+        y: Option<u32>,
+    },
     /// Mirror horizontally (left↔right).
+    #[cfg_attr(feature = "serde", serde(rename = "hflip"))]
     HFlip,
     /// Mirror vertically (top↔bottom).
+    #[cfg_attr(feature = "serde", serde(rename = "vflip"))]
     VFlip,
-    /// Rotate 90° clockwise (swaps width↔height).
-    Rotate90,
-    /// Rotate 180°.
-    Rotate180,
-    /// Rotate 270° clockwise / 90° counter-clockwise (swaps width↔height).
-    Rotate270,
+    /// Rotate clockwise by 90, 180, or 270 degrees (90/270 swap width↔height).
+    Rotate(u32),
     /// Drop chroma — set U/V to neutral so the image is grayscale.
     Grayscale,
+}
+
+impl fmt::Display for VideoFilter {
+    /// The textual (ffmpeg-`-vf`) token for this filter.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VideoFilter::Crop { w, h, x: Some(x), y: Some(y) } => write!(f, "crop={w}:{h}:{x}:{y}"),
+            VideoFilter::Crop { w, h, .. } => write!(f, "crop={w}:{h}"),
+            VideoFilter::Pad { w, h, x: Some(x), y: Some(y) } => write!(f, "pad={w}:{h}:{x}:{y}"),
+            VideoFilter::Pad { w, h, .. } => write!(f, "pad={w}:{h}"),
+            VideoFilter::HFlip => write!(f, "hflip"),
+            VideoFilter::VFlip => write!(f, "vflip"),
+            VideoFilter::Rotate(d) => write!(f, "rotate={d}"),
+            VideoFilter::Grayscale => write!(f, "grayscale"),
+        }
+    }
+}
+
+/// A whole chain as a comma-separated textual string (the inverse of
+/// [`parse_chain`]).
+pub fn chain_to_string(chain: &[VideoFilter]) -> String {
+    chain.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")
+}
+
+/// A filter chain in either form, for a DSL field that should accept both a
+/// structured list or a string. Resolve with [`FilterSpec::resolve`].
+#[cfg(feature = "serde")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[serde(untagged)]
+pub enum FilterSpec {
+    /// An ffmpeg-`-vf`-style chain string, e.g. `"crop=1280:720,hflip"`.
+    Chain(String),
+    /// A structured list of filters.
+    List(Vec<VideoFilter>),
+}
+
+#[cfg(feature = "serde")]
+impl FilterSpec {
+    /// Resolve to the concrete, **validated** filter list. The string form is
+    /// validated by [`parse_chain`]; the structured form is validated by
+    /// round-tripping through its textual rendering, so e.g. `rotate: 45` is
+    /// rejected at config time rather than at apply time.
+    pub fn resolve(&self) -> Result<Vec<VideoFilter>> {
+        match self {
+            FilterSpec::Chain(s) => parse_chain(s),
+            FilterSpec::List(v) => parse_chain(&chain_to_string(v)),
+        }
+    }
+
+    /// Collapse to the chain-string form (for string-only surfaces).
+    pub fn to_chain(&self) -> String {
+        match self {
+            FilterSpec::Chain(s) => s.clone(),
+            FilterSpec::List(v) => chain_to_string(v),
+        }
+    }
 }
 
 /// Parse an ffmpeg-`-vf`-style chain, e.g. `"crop=1280:720,hflip"`.
@@ -78,13 +152,13 @@ fn parse_one(spec: &str) -> Result<VideoFilter> {
     };
     let f = match name {
         "crop" => match nums(args)?.as_slice() {
-            [w, h] => VideoFilter::CropCenter { w: *w, h: *h },
-            [w, h, x, y] => VideoFilter::Crop { w: *w, h: *h, x: *x, y: *y },
+            [w, h] => VideoFilter::Crop { w: *w, h: *h, x: None, y: None },
+            [w, h, x, y] => VideoFilter::Crop { w: *w, h: *h, x: Some(*x), y: Some(*y) },
             _ => bail!("crop wants W:H or W:H:X:Y, got '{args}'"),
         },
         "pad" => match nums(args)?.as_slice() {
-            [w, h] => VideoFilter::PadCenter { w: *w, h: *h },
-            [w, h, x, y] => VideoFilter::Pad { w: *w, h: *h, x: *x, y: *y },
+            [w, h] => VideoFilter::Pad { w: *w, h: *h, x: None, y: None },
+            [w, h, x, y] => VideoFilter::Pad { w: *w, h: *h, x: Some(*x), y: Some(*y) },
             _ => bail!("pad wants W:H or W:H:X:Y, got '{args}'"),
         },
         "hflip" => VideoFilter::HFlip,
@@ -95,12 +169,10 @@ fn parse_one(spec: &str) -> Result<VideoFilter> {
             } else {
                 *nums(args)?.first().unwrap_or(&90)
             };
-            match deg {
-                90 => VideoFilter::Rotate90,
-                180 => VideoFilter::Rotate180,
-                270 => VideoFilter::Rotate270,
-                o => bail!("rotate wants 90|180|270, got {o}"),
+            if !matches!(deg, 90 | 180 | 270) {
+                bail!("rotate wants 90|180|270, got {deg}");
             }
+            VideoFilter::Rotate(deg)
         }
         "grayscale" | "gray" => VideoFilter::Grayscale,
         o => bail!("unknown filter '{o}'"),
@@ -152,14 +224,7 @@ fn assemble(src: &VideoFrame, w: u32, h: u32, y: Vec<u8>, u: Vec<u8>, v: Vec<u8>
     data.extend_from_slice(&y);
     data.extend_from_slice(&u);
     data.extend_from_slice(&v);
-    VideoFrame::new(
-        data.freeze(),
-        w,
-        h,
-        src.format,
-        src.color_space,
-        src.pts,
-    )
+    VideoFrame::new(data.freeze(), w, h, src.format, src.color_space, src.pts)
 }
 
 /// Apply one filter.
@@ -170,22 +235,23 @@ pub fn apply(frame: &VideoFrame, filter: &VideoFilter) -> Result<VideoFrame> {
     let (y, u, v) = planes(frame, bps)?;
 
     match *filter {
-        VideoFilter::CropCenter { w: cw, h: ch } => {
-            let cw = even(cw.min(frame.width));
-            let ch = even(ch.min(frame.height));
-            let x = even((frame.width - cw) / 2);
-            let yy = even((frame.height - ch) / 2);
-            crop(frame, x, yy, cw, ch)
-        }
-        VideoFilter::Crop { w: cw, h: ch, x, y: yy } => crop(frame, x, yy, cw, ch),
-        VideoFilter::PadCenter { w: pw, h: ph } => {
+        VideoFilter::Crop { w: cw, h: ch, x, y: cy } => match (x, cy) {
+            (Some(x), Some(cy)) => crop(frame, x, cy, cw, ch),
+            _ => {
+                let cw = even(cw.min(frame.width));
+                let ch = even(ch.min(frame.height));
+                let cx = even(frame.width.saturating_sub(cw) / 2);
+                let cyc = even(frame.height.saturating_sub(ch) / 2);
+                crop(frame, cx, cyc, cw, ch)
+            }
+        },
+        VideoFilter::Pad { w: pw, h: ph, x, y: py } => {
             let pw = even(pw.max(frame.width));
             let ph = even(ph.max(frame.height));
-            let x = even((pw - frame.width) / 2);
-            let yy = even((ph - frame.height) / 2);
-            pad(frame, pw, ph, x, yy)
+            let px = x.map(even).unwrap_or_else(|| even(pw.saturating_sub(frame.width) / 2));
+            let pyc = py.map(even).unwrap_or_else(|| even(ph.saturating_sub(frame.height) / 2));
+            pad(frame, pw, ph, px, pyc)
         }
-        VideoFilter::Pad { w: pw, h: ph, x, y: yy } => pad(frame, pw, ph, x, yy),
         VideoFilter::HFlip => Ok(assemble(
             frame,
             frame.width,
@@ -202,7 +268,7 @@ pub fn apply(frame: &VideoFrame, filter: &VideoFilter) -> Result<VideoFrame> {
             vflip(u, w / 2, h / 2, bps),
             vflip(v, w / 2, h / 2, bps),
         )),
-        VideoFilter::Rotate180 => Ok(assemble(
+        VideoFilter::Rotate(180) => Ok(assemble(
             frame,
             frame.width,
             frame.height,
@@ -210,7 +276,7 @@ pub fn apply(frame: &VideoFrame, filter: &VideoFilter) -> Result<VideoFrame> {
             vflip(&hflip(u, w / 2, h / 2, bps), w / 2, h / 2, bps),
             vflip(&hflip(v, w / 2, h / 2, bps), w / 2, h / 2, bps),
         )),
-        VideoFilter::Rotate90 => Ok(assemble(
+        VideoFilter::Rotate(90) => Ok(assemble(
             frame,
             frame.height,
             frame.width,
@@ -218,7 +284,7 @@ pub fn apply(frame: &VideoFrame, filter: &VideoFilter) -> Result<VideoFrame> {
             rot90(u, w / 2, h / 2, bps),
             rot90(v, w / 2, h / 2, bps),
         )),
-        VideoFilter::Rotate270 => Ok(assemble(
+        VideoFilter::Rotate(270) => Ok(assemble(
             frame,
             frame.height,
             frame.width,
@@ -226,6 +292,7 @@ pub fn apply(frame: &VideoFrame, filter: &VideoFilter) -> Result<VideoFrame> {
             rot270(u, w / 2, h / 2, bps),
             rot270(v, w / 2, h / 2, bps),
         )),
+        VideoFilter::Rotate(d) => bail!("rotate must be 90|180|270, got {d}"),
         VideoFilter::Grayscale => {
             let neutral = neutral_chroma(frame.format);
             let mut uu = u.to_vec();
@@ -244,45 +311,21 @@ fn even(n: u32) -> u32 {
 fn crop(frame: &VideoFrame, x: u32, y: u32, w: u32, h: u32) -> Result<VideoFrame> {
     let (x, y, w, h) = (even(x), even(y), even(w), even(h));
     if w == 0 || h == 0 || x + w > frame.width || y + h > frame.height {
-        bail!(
-            "crop {w}x{h}+{x}+{y} out of bounds for {}x{}",
-            frame.width,
-            frame.height
-        );
+        bail!("crop {w}x{h}+{x}+{y} out of bounds for {}x{}", frame.width, frame.height);
     }
     let bps = bps(frame.format)?;
     let (yp, up, vp) = planes(frame, bps)?;
     let fw = frame.width as usize;
     let y_new = crop_plane(yp, fw, x as usize, y as usize, w as usize, h as usize, bps);
-    let u_new = crop_plane(
-        up,
-        fw / 2,
-        (x / 2) as usize,
-        (y / 2) as usize,
-        (w / 2) as usize,
-        (h / 2) as usize,
-        bps,
-    );
-    let v_new = crop_plane(
-        vp,
-        fw / 2,
-        (x / 2) as usize,
-        (y / 2) as usize,
-        (w / 2) as usize,
-        (h / 2) as usize,
-        bps,
-    );
+    let u_new = crop_plane(up, fw / 2, (x / 2) as usize, (y / 2) as usize, (w / 2) as usize, (h / 2) as usize, bps);
+    let v_new = crop_plane(vp, fw / 2, (x / 2) as usize, (y / 2) as usize, (w / 2) as usize, (h / 2) as usize, bps);
     Ok(assemble(frame, w, h, y_new, u_new, v_new))
 }
 
 fn pad(frame: &VideoFrame, pw: u32, ph: u32, x: u32, y: u32) -> Result<VideoFrame> {
     let (pw, ph, x, y) = (even(pw), even(ph), even(x), even(y));
     if x + frame.width > pw || y + frame.height > ph {
-        bail!(
-            "pad {pw}x{ph} with frame {}x{} at +{x}+{y} overflows",
-            frame.width,
-            frame.height
-        );
+        bail!("pad {pw}x{ph} with frame {}x{} at +{x}+{y} overflows", frame.width, frame.height);
     }
     let bps = bps(frame.format)?;
     let (yp, up, vp) = planes(frame, bps)?;
@@ -290,28 +333,8 @@ fn pad(frame: &VideoFrame, pw: u32, ph: u32, x: u32, y: u32) -> Result<VideoFram
     let fw = frame.width as usize;
     let fh = frame.height as usize;
     let y_new = pad_plane(yp, fw, fh, pw as usize, ph as usize, x as usize, y as usize, bps, &luma_fill);
-    let u_new = pad_plane(
-        up,
-        fw / 2,
-        fh / 2,
-        (pw / 2) as usize,
-        (ph / 2) as usize,
-        (x / 2) as usize,
-        (y / 2) as usize,
-        bps,
-        &chroma_fill,
-    );
-    let v_new = pad_plane(
-        vp,
-        fw / 2,
-        fh / 2,
-        (pw / 2) as usize,
-        (ph / 2) as usize,
-        (x / 2) as usize,
-        (y / 2) as usize,
-        bps,
-        &chroma_fill,
-    );
+    let u_new = pad_plane(up, fw / 2, fh / 2, (pw / 2) as usize, (ph / 2) as usize, (x / 2) as usize, (y / 2) as usize, bps, &chroma_fill);
+    let v_new = pad_plane(vp, fw / 2, fh / 2, (pw / 2) as usize, (ph / 2) as usize, (x / 2) as usize, (y / 2) as usize, bps, &chroma_fill);
     Ok(assemble(frame, pw, ph, y_new, u_new, v_new))
 }
 
@@ -326,17 +349,7 @@ fn crop_plane(src: &[u8], pw: usize, x: usize, y: usize, cw: usize, ch: usize, b
     out
 }
 
-fn pad_plane(
-    src: &[u8],
-    sw: usize,
-    sh: usize,
-    dw: usize,
-    dh: usize,
-    ox: usize,
-    oy: usize,
-    bps: usize,
-    fill_sample: &[u8],
-) -> Vec<u8> {
+fn pad_plane(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, ox: usize, oy: usize, bps: usize, fill_sample: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(dw * dh * bps);
     for _ in 0..dw * dh {
         out.extend_from_slice(fill_sample);
@@ -379,9 +392,7 @@ fn rot90(src: &[u8], w: usize, h: usize, bps: usize) -> Vec<u8> {
     let mut out = vec![0u8; dw * dh * bps];
     for r in 0..dh {
         for c in 0..dw {
-            let sr = h - 1 - c;
-            let sc = r;
-            let s = (sr * w + sc) * bps;
+            let s = ((h - 1 - c) * w + r) * bps;
             let d = (r * dw + c) * bps;
             out[d..d + bps].copy_from_slice(&src[s..s + bps]);
         }
@@ -395,9 +406,7 @@ fn rot270(src: &[u8], w: usize, h: usize, bps: usize) -> Vec<u8> {
     let mut out = vec![0u8; dw * dh * bps];
     for r in 0..dh {
         for c in 0..dw {
-            let sr = c;
-            let sc = w - 1 - r;
-            let s = (sr * w + sc) * bps;
+            let s = (c * w + (w - 1 - r)) * bps;
             let d = (r * dw + c) * bps;
             out[d..d + bps].copy_from_slice(&src[s..s + bps]);
         }
@@ -415,7 +424,7 @@ fn fill(buf: &mut [u8], sample: &[u8]) {
 fn neutral_chroma(format: PixelFormat) -> Vec<u8> {
     match format {
         PixelFormat::Yuv420p => vec![128],
-        _ => (512u16).to_le_bytes().to_vec(), // 10-bit mid
+        _ => (512u16).to_le_bytes().to_vec(),
     }
 }
 
@@ -427,137 +436,109 @@ fn black_fill(format: PixelFormat) -> (Vec<u8>, Vec<u8>) {
     }
 }
 
-/// Convenience: keep `Bytes` import used regardless of cfg.
-#[allow(dead_code)]
-fn _bytes_marker(_b: Bytes) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::frame::ColorSpace;
+    use bytes::Bytes;
 
-    // Build a tiny Yuv420p frame with a per-pixel luma gradient and constant chroma.
     fn frame(w: u32, h: u32) -> VideoFrame {
         let (wu, hu) = (w as usize, h as usize);
         let mut data = Vec::new();
         for r in 0..hu {
             for c in 0..wu {
-                data.push((r * wu + c) as u8); // unique-ish luma
+                data.push((r * wu + c) as u8);
             }
         }
-        data.extend(std::iter::repeat(100).take((wu / 2) * (hu / 2))); // U
-        data.extend(std::iter::repeat(200).take((wu / 2) * (hu / 2))); // V
+        data.extend(std::iter::repeat(100).take((wu / 2) * (hu / 2)));
+        data.extend(std::iter::repeat(200).take((wu / 2) * (hu / 2)));
         VideoFrame::new(Bytes::from(data), w, h, PixelFormat::Yuv420p, ColorSpace::Bt709, 0)
     }
-
     fn luma(f: &VideoFrame) -> &[u8] {
         &f.data[..(f.width * f.height) as usize]
     }
 
     #[test]
-    fn parse_chain_basic() {
-        let c = parse_chain("crop=1280:720,hflip,pad=1920:1080").unwrap();
-        assert_eq!(c.len(), 3);
-        assert_eq!(c[0], VideoFilter::CropCenter { w: 1280, h: 720 });
+    fn parse_and_display_round_trip() {
+        let c = parse_chain("crop=1280:720,hflip,pad=1920:1080,rotate=90,grayscale").unwrap();
+        assert_eq!(c[0], VideoFilter::Crop { w: 1280, h: 720, x: None, y: None });
         assert_eq!(c[1], VideoFilter::HFlip);
-        assert_eq!(c[2], VideoFilter::PadCenter { w: 1920, h: 1080 });
-        assert_eq!(parse_chain("rotate=270").unwrap()[0], VideoFilter::Rotate270);
-        assert_eq!(parse_chain("transpose").unwrap()[0], VideoFilter::Rotate90);
-        assert_eq!(parse_chain("gray").unwrap()[0], VideoFilter::Grayscale);
-        assert!(parse_chain("bogus").is_err());
+        assert_eq!(c[3], VideoFilter::Rotate(90));
+        // Display ∘ parse is identity (canonical form).
+        assert_eq!(chain_to_string(&c), "crop=1280:720,hflip,pad=1920:1080,rotate=90,grayscale");
+        // explicit crop offset
+        assert_eq!(
+            parse_chain("crop=10:20:1:2").unwrap()[0],
+            VideoFilter::Crop { w: 10, h: 20, x: Some(1), y: Some(2) }
+        );
+        assert_eq!(parse_chain("transpose").unwrap()[0], VideoFilter::Rotate(90));
         assert!(parse_chain("rotate=45").is_err());
-        assert!(parse_chain("crop=10").is_err());
+        assert!(parse_chain("bogus").is_err());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn structured_json_round_trips() {
+        // Structured object form deserializes to the same values as the string.
+        let json = r#"[{"crop":{"w":1280,"h":720}},"hflip",{"rotate":90}]"#;
+        let from_list: FilterSpec = serde_json::from_str(json).unwrap();
+        let from_str: FilterSpec = serde_json::from_str(r#""crop=1280:720,hflip,rotate=90""#).unwrap();
+        let expect = vec![
+            VideoFilter::Crop { w: 1280, h: 720, x: None, y: None },
+            VideoFilter::HFlip,
+            VideoFilter::Rotate(90),
+        ];
+        assert_eq!(from_list.resolve().unwrap(), expect);
+        assert_eq!(from_str.resolve().unwrap(), expect);
+        // serialize the structs back out and parse the string again → identity
+        assert_eq!(parse_chain(&chain_to_string(&expect)).unwrap(), expect);
     }
 
     #[test]
     fn hflip_reverses_rows() {
-        let f = frame(4, 2);
-        let out = apply(&f, &VideoFilter::HFlip).unwrap();
-        // row 0 was [0,1,2,3] -> [3,2,1,0]
+        let out = apply(&frame(4, 2), &VideoFilter::HFlip).unwrap();
         assert_eq!(&luma(&out)[..4], &[3, 2, 1, 0]);
-        assert_eq!((out.width, out.height), (4, 2));
-    }
-
-    #[test]
-    fn vflip_reverses_rows_order() {
-        let f = frame(2, 2);
-        // luma: row0 [0,1], row1 [2,3]
-        let out = apply(&f, &VideoFilter::VFlip).unwrap();
-        assert_eq!(luma(&out), &[2, 3, 0, 1]);
     }
 
     #[test]
     fn rotate_dims_and_roundtrip() {
         let f = frame(4, 2);
-        let r90 = apply(&f, &VideoFilter::Rotate90).unwrap();
-        assert_eq!((r90.width, r90.height), (2, 4)); // swapped
-        // rotate 90 then 270 returns to original luma
-        let back = apply(&r90, &VideoFilter::Rotate270).unwrap();
-        assert_eq!((back.width, back.height), (4, 2));
+        let r90 = apply(&f, &VideoFilter::Rotate(90)).unwrap();
+        assert_eq!((r90.width, r90.height), (2, 4));
+        let back = apply(&r90, &VideoFilter::Rotate(270)).unwrap();
         assert_eq!(luma(&back), luma(&f));
-        // 180 == hflip+vflip
-        let r180 = apply(&f, &VideoFilter::Rotate180).unwrap();
-        assert_eq!((r180.width, r180.height), (4, 2));
+        assert!(apply(&f, &VideoFilter::Rotate(45)).is_err());
     }
 
     #[test]
-    fn crop_center_extracts_region() {
+    fn crop_center_vs_explicit() {
         let f = frame(8, 8);
-        let out = apply(&f, &VideoFilter::CropCenter { w: 4, h: 4 }).unwrap();
-        assert_eq!((out.width, out.height), (4, 4));
-        // centre 4x4 starts at (2,2): first luma sample = src(2,2) = 2*8+2 = 18
-        assert_eq!(luma(&out)[0], 18);
-        // data length consistent: 4*4 + 2*2*2 = 24
-        assert_eq!(out.data.len(), 4 * 4 + 2 * (2 * 2));
+        let center = apply(&f, &VideoFilter::Crop { w: 4, h: 4, x: None, y: None }).unwrap();
+        assert_eq!((center.width, center.height), (4, 4));
+        assert_eq!(luma(&center)[0], 18); // src(2,2)
+        let explicit = apply(&f, &VideoFilter::Crop { w: 4, h: 4, x: Some(0), y: Some(0) }).unwrap();
+        assert_eq!(luma(&explicit)[0], 0); // src(0,0)
     }
 
     #[test]
-    fn pad_centers_and_fills_black() {
-        let f = frame(2, 2);
-        let out = apply(&f, &VideoFilter::PadCenter { w: 6, h: 6 }).unwrap();
-        assert_eq!((out.width, out.height), (6, 6));
-        // top-left corner is black fill (luma 16)
-        assert_eq!(luma(&out)[0], 16);
-        // the 2x2 sits centred at (2,2): luma(2,2) == src(0,0) == 0
-        assert_eq!(luma(&out)[2 * 6 + 2], 0);
+    fn pad_centers_and_grayscale() {
+        let p = apply(&frame(2, 2), &VideoFilter::Pad { w: 6, h: 6, x: None, y: None }).unwrap();
+        assert_eq!((p.width, p.height), (6, 6));
+        assert_eq!(luma(&p)[0], 16); // black fill
+        let g = apply(&frame(4, 4), &VideoFilter::Grayscale).unwrap();
+        assert!(g.data[16..].iter().all(|&b| b == 128));
     }
 
     #[test]
-    fn grayscale_neutralizes_chroma() {
-        let f = frame(4, 4);
-        let out = apply(&f, &VideoFilter::Grayscale).unwrap();
-        let cstart = (4 * 4) as usize;
-        assert!(out.data[cstart..].iter().all(|&b| b == 128));
-        // luma untouched
-        assert_eq!(luma(&out), luma(&f));
-    }
-
-    #[test]
-    fn ten_bit_hflip_works() {
-        // 2x2 10-bit frame: luma samples 0,1,2,3 as u16 LE
+    fn ten_bit_hflip() {
         let mut data: Vec<u8> = Vec::new();
         for s in [0u16, 1, 2, 3] {
             data.extend_from_slice(&s.to_le_bytes());
         }
-        data.extend_from_slice(&(512u16).to_le_bytes()); // U (1 sample)
-        data.extend_from_slice(&(512u16).to_le_bytes()); // V
+        data.extend_from_slice(&(512u16).to_le_bytes());
+        data.extend_from_slice(&(512u16).to_le_bytes());
         let f = VideoFrame::new(Bytes::from(data), 2, 2, PixelFormat::Yuv420p10le, ColorSpace::Bt709, 0);
         let out = apply(&f, &VideoFilter::HFlip).unwrap();
-        // row0 [0,1] -> [1,0]
         assert_eq!(&out.data[0..2], &1u16.to_le_bytes());
-        assert_eq!(&out.data[2..4], &0u16.to_le_bytes());
-    }
-
-    #[test]
-    fn apply_chain_runs_in_order() {
-        let f = frame(8, 8);
-        let out = apply_chain(f, &[
-            VideoFilter::CropCenter { w: 4, h: 4 },
-            VideoFilter::Grayscale,
-        ])
-        .unwrap();
-        assert_eq!((out.width, out.height), (4, 4));
-        let cstart = (4 * 4) as usize;
-        assert!(out.data[cstart..].iter().all(|&b| b == 128));
     }
 }

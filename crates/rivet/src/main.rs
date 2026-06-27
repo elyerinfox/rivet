@@ -416,7 +416,10 @@ fn run() -> Result<()> {
             width,
             height,
             gpu,
-            filter,
+            filters: match filter {
+                Some(s) => codec::filter::parse_chain(&s).context("parsing --filter")?,
+                None => Vec::new(),
+            },
             ..Default::default()
         }),
         #[cfg(feature = "ipc")]
@@ -476,6 +479,10 @@ fn transcode_cmd(args: TranscodeArgs) -> Result<()> {
         .iter()
         .map(|s| parse_wxh(s))
         .collect::<Result<Vec<_>>>()?;
+    let filters = match args.filter.as_deref() {
+        Some(s) => codec::filter::parse_chain(s).context("parsing --filter")?,
+        None => Vec::new(),
+    };
     let settings = TranscodeSettings {
         mode: Some(match args.mode {
             ModeArg::Single => rivet::Mode::Single,
@@ -498,7 +505,7 @@ fn transcode_cmd(args: TranscodeArgs) -> Result<()> {
         decode_gpu: args.decode_gpu,
         width: None,
         height: None,
-        filter: args.filter.clone(),
+        filters,
     };
     let spec = settings
         .into_spec(probed.width, probed.height)
