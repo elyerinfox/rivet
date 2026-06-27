@@ -31,7 +31,8 @@ use crate::frame::{ColorSpace, PixelFormat, VideoFrame};
 use crate::qsv_ffi::{
     MFX_CHROMAFORMAT_YUV420, MFX_CODEC_AV1, MFX_CODEC_AVC, MFX_CODEC_HEVC, MFX_CODEC_VP9,
     MFX_ERR_MORE_DATA, MFX_ERR_MORE_SURFACE, MFX_ERR_NONE, MFX_FOURCC_NV12, MFX_FOURCC_P010,
-    MfxBitstream, MfxFrameSurface1, MfxSession, MfxStatus, MfxSyncPoint, MfxVersion, MfxVideoParam,
+    MFX_PICSTRUCT_PROGRESSIVE, MfxBitstream, MfxFrameSurface1, MfxSession, MfxStatus, MfxSyncPoint,
+    MfxVersion, MfxVideoParam,
 };
 
 // decode-only constants
