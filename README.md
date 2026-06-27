@@ -13,8 +13,9 @@ It is built from clean-room demuxers, muxers, and hardware-codec dispatch —
 **no FFmpeg required** by default (FFmpeg is available as an optional decode
 backend behind a feature flag).
 
-📖 **Detailed docs** live in [`docs/`](docs/) — [CLI reference](docs/cli.md) ·
-[HTTP API reference](docs/api.md). This README is the quick tour.
+📖 **Detailed docs** live in [`docs/`](docs/) — [Pipeline & architecture](docs/pipeline.md) ·
+[CLI reference](docs/cli.md) · [HTTP API reference](docs/api.md). This README is
+the quick tour.
 
 ## Why "rivet"
 
@@ -50,6 +51,10 @@ cleanly. Stitched chunks always play (each is an independent IDR-led GOP), and
 `ChunkSeamMode` (CLI `--seam-mode`, API `seam`) controls quality across the
 seams: `Parallel` (default, fastest), `ParallelConstQp` (constant-QP, seam-flat),
 or `Serial` (one encoder, seam-free) — see the [CLI reference](docs/cli.md#chunk-seams---seam-mode).
+
+> The full data flow — demux → decode-once pump → per-rung scale → multi-GPU
+> lease engine → mux — is documented in
+> **[docs/pipeline.md](docs/pipeline.md)** (with a diagram and a code map).
 
 **"Optimized for web" is a pile of decisions FFmpeg leaves to you.** rivet bakes
 in defaults that just play in a browser (and lets you override them): AV1 (the

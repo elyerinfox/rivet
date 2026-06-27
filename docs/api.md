@@ -2,7 +2,8 @@
 
 A small axum webserver (behind the `server` feature) so another application can
 **signal rivet to transcode** over the network. It runs the same configurable
-engine as the [CLI](cli.md): POST media + an output spec, rivet transcodes to
+engine as the [CLI](cli.md) — see [pipeline & architecture](pipeline.md) for how
+that engine works internally: POST media + an output spec, rivet transcodes to
 AV1 and reports per-rung progress, and you fetch the artifacts.
 
 ```sh

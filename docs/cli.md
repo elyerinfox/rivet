@@ -1,5 +1,8 @@
 # rivet CLI reference
 
+> What happens under the hood for any of these commands — demux → decode-once
+> pump → multi-GPU encode → mux — is in [pipeline & architecture](pipeline.md).
+
 The `rivet` binary has three subcommands: [`transcode`](#rivet-transcode),
 [`probe`](#rivet-probe), and [`serve`](#rivet-serve). Build it with:
 
