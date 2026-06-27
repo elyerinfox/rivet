@@ -3,9 +3,10 @@
 > What happens under the hood for any of these commands — demux → decode-once
 > pump → multi-GPU encode → mux — is in [pipeline & architecture](pipeline.md).
 
-The `rivet` binary has five subcommands: [`transcode`](#rivet-transcode),
+The `rivet` binary has seven subcommands: [`transcode`](#rivet-transcode),
 [`probe`](#rivet-probe), [`devices`](#rivet-devices),
-[`capabilities`](#rivet-capabilities), and [`serve`](#rivet-serve). Build it with:
+[`capabilities`](#rivet-capabilities), [`pipe`](#rivet-pipe),
+[`ipc`](#rivet-ipc), and [`serve`](#rivet-serve). Build it with:
 
 ```sh
 cargo build --release                     # CPU/GPU decode + GPU encode tiers
@@ -201,6 +202,63 @@ cargo build --release --features qsv
 rivet capabilities            # Encode: qsv 10-bit HDR · Decode: h264/hevc/av1/vp9 → qsv
 rivet caps --json
 ```
+
+---
+
+## `rivet pipe`
+
+```
+rivet pipe
+```
+
+Stream a transcode through standard I/O: read media from **stdin**, write the
+AV1/MP4 to **stdout**. Output is the single-file default (source resolution, AV1
++ AAC/Opus-passthrough, 8-bit SDR — i.e. `transcode_bytes`); progress goes to
+stderr so stdout stays clean. The cross-platform way for another process to
+stream data in and get transcoded data back:
+
+```sh
+cat input.mkv | rivet pipe > output.mp4
+ffmpeg -i src.mov -f matroska - | rivet pipe | ./my-uploader
+```
+
+For per-job options (ladder, HLS, GPU policy, color) use [`transcode`](#rivet-transcode)
+with files; `pipe` is the zero-config streaming path.
+
+## `rivet ipc`
+
+```
+rivet ipc --socket <PATH>
+```
+
+Run a **Unix-domain-socket** server (Unix only) so a long-running application can
+stream jobs in and out without spawning a process per file or going through HTTP.
+Bind a socket, then for **each connection**: the client writes the input media,
+**half-closes** its write side (signals end-of-input), and reads the transcoded
+AV1/MP4 back until EOF. One thread per connection; the process-wide GPU pool
+serializes the actual GPU work, so concurrent clients simply queue.
+
+```sh
+rivet ipc --socket /tmp/rivet.sock &
+# any client that does write → shutdown(WR) → read works, e.g. socat:
+socat - UNIX-CONNECT:/tmp/rivet.sock < input.mkv > output.mp4
+```
+
+A minimal client (Python):
+
+```python
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/tmp/rivet.sock")
+s.sendall(open("input.mkv", "rb").read())
+s.shutdown(socket.SHUT_WR)                 # end-of-input
+out = b"".join(iter(lambda: s.recv(65536), b""))
+open("output.mp4", "wb").write(out)        # AV1/MP4
+```
+
+Output is the same single-file default as `pipe`. On **Windows** `rivet ipc` is
+unavailable — use [`rivet pipe`](#rivet-pipe) (stdin/stdout) or
+[`rivet serve`](#rivet-serve) (HTTP).
 
 ---
 
