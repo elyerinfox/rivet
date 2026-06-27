@@ -1,7 +1,13 @@
 # rivet
 
+[![crates.io](https://img.shields.io/crates/v/rivet-transcoder.svg?logo=rust)](https://crates.io/crates/rivet-transcoder)
+[![Downloads](https://img.shields.io/crates/d/rivet-transcoder.svg)](https://crates.io/crates/rivet-transcoder)
+[![docs.rs](https://img.shields.io/docsrs/rivet-transcoder.svg?logo=docsdotrs)](https://docs.rs/rivet-transcoder)
+[![License](https://img.shields.io/badge/license-source--available-orange.svg)](LICENSE.md)
+
 A modular, GPU-accelerated video transcoding **library** and **command-line
-tool**, written in Rust.
+tool**, written in Rust. Install the CLI with `cargo install rivet-transcoder`
+(the command is `rivet`), or add the library with `cargo add rivet-transcoder`.
 
 `rivet` takes an arbitrary input file and transcodes it to **AV1** — as a
 single MP4, a multi-rendition ABR ladder, or a segmented **CMAF/HLS** package.
