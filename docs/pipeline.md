@@ -15,7 +15,7 @@ be reused (and a standalone `rivet` CLI/server built on top).
 | Crate | Role | Key modules |
 |-------|------|-------------|
 | **`container`** | Demux (in) + mux (out). Clean-room, no FFmpeg. | `streaming` (MP4/MKV/TS/AVI streaming demuxers), `mux` (faststart AV1 MP4), `cmaf` (fragmented-MP4 segments), `hls` (playlists), `annexb` (AVCC→Annex-B) |
-| **`codec`** | Frame types, GPU decode/encode dispatch, colorspace, probe. | `decode` (NVDEC/AMF/QSV/ffmpeg), `encode` (NVENC/AMF/QSV/ffmpeg), `colorspace` + `tonemap`, `gpu` (detection), `frame` |
+| **`codec`** | Frame types, GPU decode/encode dispatch, colorspace, probe. | `decode` (NVDEC/AMF/QSV — GPU-only), `encode` (NVENC/AMF/QSV + optional ffmpeg), `colorspace` + `tonemap`, `gpu` (detection), `frame` |
 | **`rivet`** | The job engine + the multi-GPU reactive scheduler + the CLI/server. | `job`, `decode_pump`, `multigpu`, `gpu_pool`, `rung_scaler`, `frame_queue`, `encoder_worker`, `spec`, `ladder`, `progress` |
 
 The hardware GPU paths in `codec` are all hand-rolled `dlopen` FFI in-tree (no
@@ -34,7 +34,7 @@ flowchart TD
 
     subgraph PUMP["Shared decode pump (decode the source ONCE)"]
         direction TB
-        DEC["create_decoder<br/>GPU dispatch: NVDEC / AMF / QSV / ffmpeg"]
+        DEC["create_decoder<br/>GPU-only: NVDEC / AMF / QSV"]
         DEC --> NORM["normalize, rung-agnostic:<br/>4:4:4 → 4:2:0 · HDR → SDR tonemap (policy)"]
     end
 
@@ -94,19 +94,20 @@ slowest rung (usually the largest, whose encoder is slowest) throttles the pump.
 
 ### GPU decode dispatch
 
-`codec::decode::create_decoder` picks a decoder by tier, in order, for the
-detected GPU and codec:
+`codec::decode::create_decoder` is **GPU-only** — it picks a hardware decoder
+for the detected GPU + codec, in vendor order, and **hard-fails** if none
+matches (CPU decoders were removed per the GPU-only directive):
 
-1. **FFmpeg** (`ffmpeg` feature, if built and not `DISABLE_FFMPEG`) — libavcodec
-   primary path.
-2. **NVDEC** (`nvidia`) — hand-rolled CUVID; H.264/HEVC/AV1/VP8/VP9/MPEG-2/MPEG-4,
+1. **NVDEC** (`nvidia`) — hand-rolled CUVID; H.264/HEVC/AV1/VP8/VP9/MPEG-2/MPEG-4,
    10-bit P016. Skippable with `DISABLE_NVDEC` / `DISABLE_NVDEC_<CODEC>`.
-3. **AMF** (`amd`) — hand-rolled AMF decode; H.264/HEVC/AV1/VP9.
-4. **QSV** (`qsv`) — hand-rolled oneVPL 2.x decode (internal-allocation +
+2. **AMF** (`amd`) — hand-rolled AMF decode; H.264/HEVC/AV1/VP9.
+3. **QSV** (`qsv`) — hand-rolled oneVPL 2.x decode (internal-allocation +
    `FrameInterface::Map`); H.264/HEVC/AV1/VP9, 10-bit P010.
 
-A decoder that fails to produce a first frame falls back to the next tier. Each
-backend implements the same `Decoder` trait (`push_sample` → `decode_next`).
+Each backend implements the same `Decoder` trait (`push_sample` → `decode_next`).
+A `FfmpegDecoder` exists in `decode/ffmpeg.rs` but is **not** wired into the
+factory (only its own tests construct it) — decode is hardware-only as built.
+See [codec-decode.md](codec-decode.md#the-decode-dispatch--tiers).
 
 ### Rung-agnostic normalization
 
@@ -176,12 +177,17 @@ pipeline). Workers exit when the queue returns `None`.
 
 ### Encode dispatch
 
-`codec::encode::create_encoder` mirrors the decode tiers: **NVENC** (`nvidia`,
-Ada+), **AMF** (`amd`, RDNA3+), **QSV** (`qsv`, Arc / Meteor Lake+), or **ffmpeg**
-software/hwaccel. All hand-rolled `dlopen` FFI. AV1 only, 4:2:0, 8- or 10-bit. A
-GPU-only build with no AV1-encode silicon fails fast at encoder construction
-(`build_output_caps()` is the runtime capability query that `OutputSpec::validate`
-consults). Force a specific backend with `TRANSCODE_ENCODER_BACKEND=nvenc|amf|qsv`.
+`codec::encode::select_encoder` tries, in order: a **FFmpeg** AV1 encoder first
+*if* the `ffmpeg` feature is built and `DISABLE_FFMPEG` isn't set (libavcodec's
+av1_nvenc/av1_qsv/libsvtav1/libaom probe chain — one interface over every vendor
+**and** the only software-encode path), then the hand-rolled **NVENC** (`nvidia`,
+Ada+) / **AMF** (`amd`, RDNA3+) / **QSV** (`qsv`, Arc / Meteor Lake+) backends —
+either pinned to the lease's vendor or NVIDIA-first. AV1 only, 4:2:0, 8- or
+10-bit. There is **no native rav1e CPU fallback** (removed per the GPU-only
+directive): on a default build, if no AV1-encode hardware is present, encoder
+construction is a hard error. `build_output_caps()` is the runtime capability
+query `OutputSpec::validate` consults; `TRANSCODE_ENCODER_BACKEND=nvenc|amf|qsv`
+forces a backend. See [codec-encode.md](codec-encode.md).
 
 ## 5. Output modes
 

@@ -13,9 +13,14 @@ It is built from clean-room demuxers, muxers, and hardware-codec dispatch —
 **no FFmpeg required** by default (FFmpeg is available as an optional decode
 backend behind a feature flag).
 
-📖 **Detailed docs** live in [`docs/`](docs/) — [Configuring a transcode (`OutputSpec` guide)](docs/output-spec.md) ·
-[Pipeline & architecture](docs/pipeline.md) · [CLI reference](docs/cli.md) ·
-[HTTP API reference](docs/api.md). This README is the quick tour.
+📖 **Detailed docs** live in [`docs/`](docs/). Start with
+[Architecture](docs/architecture.md) (the codebase map) and
+[Design decisions](docs/decisions.md) (the *why*); then
+[Pipeline](docs/pipeline.md) (data flow), the per-crate references
+([codec decode](docs/codec-decode.md) · [codec encode](docs/codec-encode.md) ·
+[container](docs/container.md) · [engine](docs/engine.md)), and the usage guides
+([OutputSpec](docs/output-spec.md) · [CLI](docs/cli.md) · [HTTP API](docs/api.md)).
+This README is the quick tour.
 
 ## Why "rivet"
 
