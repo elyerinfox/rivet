@@ -25,8 +25,8 @@ backend behind a feature flag).
 [Pipeline](docs/pipeline.md) (data flow), the per-crate references
 ([codec decode](docs/codec-decode.md) · [codec encode](docs/codec-encode.md) ·
 [container](docs/container.md) · [engine](docs/engine.md)), and the usage guides
-([OutputSpec](docs/output-spec.md) · [CLI](docs/cli.md) · [HTTP API](docs/api.md)).
-This README is the quick tour.
+([OutputSpec](docs/output-spec.md) · [Batch manifest](docs/batch.md) ·
+[CLI](docs/cli.md) · [HTTP API](docs/api.md)). This README is the quick tour.
 
 ## Why "rivet"
 
@@ -265,6 +265,10 @@ rivet capabilities [--json]   # what this build can encode/decode (alias: caps)
 cat input.mkv | rivet pipe > output.mp4                       # stdin → stdout (cross-platform)
 cat input.mkv | rivet pipe --crf 28 --width 1280 --height 720 > out.mp4  # with settings
 rivet ipc --socket /tmp/rivet.sock           # Unix-socket server; clients prefix a `#rivet k=v` header
+
+# Convert many files from a YAML/JSON manifest (feature `batch`) — see docs/batch.md
+rivet batch jobs.yaml --dry-run     # preview the plan
+rivet batch jobs.yaml               # run it
 ```
 
 GPU selection (mirrors `EncodePolicy` / `decode_gpu`):
@@ -542,7 +546,9 @@ cargo build --release --features ffmpeg
 | `qsv`       | Intel QSV AV1 hardware **encoder**, hand-rolled `dlopen` oneVPL FFI (8-bit + 10-bit). Intel Arc / Meteor Lake+. (Intel decode → `ffmpeg`.) |
 | `ffmpeg`    | libavcodec as the primary decode path (full software catalogue + Vulkan/NVDEC/D3D11/VAAPI hwaccel + AV1 software encode). Needs FFmpeg ≥7.0 dev libs + LLVM/libclang. |
 | `thumbnail` | `rivet::thumbnail::generate_thumbnail` — capture a frame and encode an AVIF still (pulls `ravif`/rav1e). |
-| `server` | HTTP transcode API (`rivet serve`) — an axum webserver so another app can signal transcodes over the network. See [HTTP API](#http-api-server-feature). |
+| `batch`     | `rivet batch` — a YAML/JSON **manifest DSL** to convert many files in one run (pulls serde + a YAML/JSON parser + glob). See [docs/batch.md](docs/batch.md). |
+| `server`    | HTTP transcode API (`rivet serve`) — an axum webserver so another app can signal transcodes over the network. See [HTTP API](#http-api-server-feature). |
+| `ipc`       | `rivet ipc` — a Unix-domain-socket server for streaming media in/out (Unix only at runtime). `rivet pipe` needs no feature. See [CLI](docs/cli.md#rivet-ipc). |
 
 The hardware **encoders** are opt-in. All three are **hand-rolled `dlopen` FFI
 in-tree** — no external wrapper crates, no bindgen, no build-time SDK link — so
