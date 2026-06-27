@@ -168,9 +168,12 @@ let spec = OutputSpec::single_file(vec![
 spec.validate()?; // rejects e.g. an HDR request on a build with no 10-bit encoder
 ```
 
-The `.web_sdr()` line is a **color preset** — one call that sets the gamut +
-transfer + bit depth together. To keep HDR instead of tonemapping (needs a 10-bit
-AV1 encoder — `nvidia`, `amd`, `qsv`, or `ffmpeg`):
+The `.web_sdr()` line is a **color preset** — one call in place of
+`.with_color(ColorPolicy::TonemapToSdr).with_bit_depth(BitDepth::EightBit)`.
+There are exactly two color/depth knobs: `with_color` (the `ColorPolicy` bundles
+the *gamut* and *transfer* — see [Output color & bit
+depth](#output-color--bit-depth)) and `with_bit_depth`. To keep HDR instead of
+tonemapping (needs a 10-bit AV1 encoder — `nvidia`, `amd`, `qsv`, or `ffmpeg`):
 
 ```rust
 let spec = OutputSpec::single_file(rungs).hdr10();   // BT.2020 + PQ, 10-bit — one call

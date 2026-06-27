@@ -26,41 +26,41 @@ external wrapper crate); they build on Windows + Linux. See the
 
 ## End-to-end flow
 
-```text
- input bytes
-     │
-     ▼  container::streaming::demux_streaming
- ┌─────────────┐   header (codec, dims, fps, color) + audio track
- │   DEMUX     │──────────────────────────────────────────────┐
- └─────────────┘                                               │
-     │ video samples (Annex-B / OBU)                           │
-     ▼                                                         │
- ┌─────────────────────────────────────────────┐              │
- │  SHARED DECODE PUMP  (decode the source ONCE) │              │
- │  codec::decode::create_decoder (GPU dispatch) │              │
- │  → rung-agnostic per-frame normalize:         │              │
- │      4:4:4 → 4:2:0 downsample                  │              │
- │      HDR → SDR tonemap (policy-driven)         │              │
- └─────────────────────────────────────────────┘              │
-     │ fan out normalized frames (cheap Arc clone)             │
-     ├───────────────┬───────────────┬───────────────┐        │
-     ▼               ▼               ▼               ▼        │
- per-rung scaler  per-rung scaler  …  (one per rung)          │
-  (bilinear to                                                │
-   rung dims, chunk into segments)                            │
-     │ SegmentChunkQueue (bounded)                            │
-     ▼                                                        │
- encoder worker(s) — each holds a GpuLease, one encoder       │
-  codec::encode::create_encoder (GPU dispatch)                │
-  + helper workers claim freed leases mid-flight              │
-     │ AV1 packets / CMAF segments                            │
-     ▼                                                        ▼
- ┌─────────────────────────────────────────────────────────────┐
- │  MUX  — container::mux (single MP4) / cmaf + hls (segments)  │
- │        + audio passthrough/transcode interleaved             │
- └─────────────────────────────────────────────────────────────┘
-     │
-     ▼  output: one faststart MP4 per rung, or a CMAF/HLS package
+```mermaid
+flowchart TD
+    IN([input bytes]) --> DEMUX["DEMUX<br/>demux_streaming"]
+    DEMUX -.->|audio track| MUX
+    DEMUX -->|"video samples (Annex-B / OBU)"| DEC
+
+    subgraph PUMP["Shared decode pump (decode the source ONCE)"]
+        direction TB
+        DEC["create_decoder<br/>GPU dispatch: NVDEC / AMF / QSV / ffmpeg"]
+        DEC --> NORM["normalize, rung-agnostic:<br/>4:4:4 → 4:2:0 · HDR → SDR tonemap (policy)"]
+    end
+
+    NORM -->|"fan out frames (Arc clone)"| SC1
+    NORM --> SC2
+    NORM --> SC3
+
+    subgraph SCALERS["Per-rung scalers + queues (one per rung)"]
+        direction TB
+        SC1["scaler 1080p"] --> Q1[["SegmentChunkQueue (bounded)"]]
+        SC2["scaler 720p"] --> Q2[["queue"]]
+        SC3["scaler 360p"] --> Q3[["queue"]]
+    end
+
+    Q1 --> W1["encoder worker<br/>holds GpuLease · create_encoder"]
+    Q2 --> W2["encoder worker"]
+    Q3 --> W3["encoder worker"]
+    Q2 -.->|"freed lease: helper dispatch"| H1["helper worker"]
+
+    W1 --> MUX
+    W2 --> MUX
+    W3 --> MUX
+    H1 --> MUX
+
+    MUX["MUX<br/>mux (single MP4) / cmaf + hls (segments) + audio"]
+    MUX --> OUT([faststart MP4 per rung<br/>or CMAF/HLS package])
 ```
 
 The entry point is [`rivet::run_job`](../crates/rivet/src/job.rs) (async) /
@@ -133,6 +133,27 @@ final partial segment and closes the queue so workers drain cleanly.
 [`crate::multigpu`](../crates/rivet/src/multigpu.rs) schedules every rung's
 segments across **all** detected GPUs:
 
+```mermaid
+flowchart LR
+    subgraph POOL["GpuPool — one lease per GPU at a time"]
+        L0[GPU 0 lease]
+        L1[GPU 1 lease]
+        L2[GPU 2 lease]
+    end
+
+    L0 -->|claimed| W1080["1080p worker<br/>(slow rung)"]
+    L1 -->|claimed| W720["720p worker"]
+    L2 -->|claimed| W360["360p worker<br/>(fast rung)"]
+
+    W360 -.->|"finishes early,<br/>releases lease"| L2
+    L2 -.->|"freed lease →<br/>helper dispatch"| HELP["helper worker<br/>attaches to 1080p"]
+    HELP -.->|"extra segments"| W1080
+
+    W1080 --> INV{{"per-rung av1C codec invariant<br/>(cross-vendor segments stay compatible)"}}
+    W720 --> INV
+    HELP --> INV
+```
+
 - **One encoder per GPU at a time.** [`GpuPool`](../crates/rivet/src/gpu_pool.rs)
   hands out a `GpuLease` per slot; an encoder worker holds it for its lifetime.
   This is load-bearing — concurrent NVENC sessions on one CUDA context were found
@@ -191,6 +212,26 @@ Two orthogonal axes on `OutputSpec`, with presets that bundle both:
 |------|------|---------|---------|
 | Color (gamut + SDR/HDR transfer) | `ColorPolicy` | `with_color` | `.web_sdr()` (default) · `.hdr10()` · `.hlg()` · `.passthrough()` |
 | Bit depth (bits per sample) | `BitDepth` | `with_bit_depth` | (HDR presets imply 10-bit) |
+
+**Why two methods, not four?** The color knobs are exactly `with_color(ColorPolicy)`
+and `with_bit_depth(BitDepth)` — there is *no* separate `with_gamut` /
+`with_transfer` / `with_color_space`. `ColorPolicy` deliberately **bundles** two
+things:
+
+- **Gamut** — the color *primaries*, i.e. which colors are representable.
+  **BT.709** (standard SDR) or **BT.2020** (wide, for HDR).
+- **Transfer** — the *transfer function* (a.k.a. transfer characteristics /
+  EOTF): the curve that maps stored pixel values ↔ actual light. SDR uses a
+  gamma curve (~2.2/2.4); HDR uses **PQ** (SMPTE ST 2084, absolute brightness, up
+  to 10k nits — HDR10) or **HLG** (ARIB STD-B67, relative — broadcast).
+
+They're bundled because only a few (gamut, transfer, depth) combinations are
+web-safe — BT.709+gamma+8-bit (SDR), BT.2020+PQ+10-bit (HDR10),
+BT.2020+HLG+10-bit (HLG). Independent gamut/transfer setters would let you spell
+nonsense (BT.709+PQ, wide-gamut SDR-gamma, …); the policy makes only the valid
+combos expressible, and the presets (`.web_sdr()` / `.hdr10()` / `.hlg()`) name
+the intent. Bit depth is the one genuinely orthogonal axis, so it gets its own
+method.
 
 `resolve_output(source_color, source_format)` collapses these against the source
 into the concrete `(ColorMetadata, PixelFormat)` the encoder gets: `Hdr10`/`Hlg`
