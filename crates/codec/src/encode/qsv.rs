@@ -64,7 +64,7 @@ use crate::frame::{PixelFormat, TransferFn, VideoFrame};
 // can't drift apart on layout again.
 use crate::qsv_ffi::{
     MfxBitstream, MfxExtBuffer, MfxFrameData, MfxFrameInfo, MfxFrameSurface1, MfxInfoMfx,
-    MfxVersion, MfxVideoParam,
+    MfxVideoParam,
 };
 
 // ─── oneVPL ABI constants ─────────────────────────────────────────
@@ -85,7 +85,6 @@ const MFX_WRN_INCOMPATIBLE_VIDEO_PARAM: MfxStatus = 5;
 const MFX_WRN_VIDEO_PARAM_CHANGED: MfxStatus = 3;
 const MFX_WRN_PARTIAL_ACCELERATION: MfxStatus = 4;
 
-const MFX_IMPL_HARDWARE_ANY: u32 = 0x0100;
 
 // Four-character codec codes (little-endian u32).
 const MFX_CODEC_AV1: u32 = 0x20315641; // 'A','V','1',' '
@@ -134,12 +133,6 @@ const MFX_EXTBUFF_VIDEO_SIGNAL_INFO: u32 = 0x4e495356; // 'V','S','I','N' LE-u32
 /// for AV1 4:2:0. Defined out-of-line so the const_assert!s can pin it.
 const MFX_TARGET_CHROMAFORMAT_YUV420_PLUS1: u16 = 2;
 
-// mfxVersion we send — min oneVPL 2.10 so AV1 encode is available.
-const MFX_MIN_VERSION: MfxVersion = MfxVersion {
-    minor: 10,
-    major: 2,
-};
-
 /// Encoder pipeline depth — number of input surfaces + sync points
 /// in flight before we must drain one. Matches Squad 5's NVENC
 /// `RING_SIZE = 4` and upstream oneVPL `sample_encode`'s recommended
@@ -166,45 +159,20 @@ struct MfxExtAv1TileParam {
     reserved: [u16; 5],
 }
 
-/// oneVPL `mfxExtCodingOption3` — 400 bytes upstream. We mirror the
-/// fields we set + the rest is opaque reserved tail. The encoder
-/// reads named fields directly; trailing reserved bytes are zero
-/// (driver-blessed default behaviour).
-///
-/// Squad-22 wires `TargetBitDepthLuma` / `TargetBitDepthChroma` for
-/// 10-bit AV1. `TargetChromaFormatPlus1` is held at
-/// `MFX_TARGET_CHROMAFORMAT_YUV420_PLUS1 = 2` (= MFX_CHROMAFORMAT_YUV420
-/// + 1, oneVPL's "plus one" convention so 0 means "use the FrameInfo
-/// chroma").
-///
-/// Layout matches `vendor/intel/mfxstructs.h::mfxExtCodingOption3`
-/// (header + 3×NumRef[8] u16 arrays + the named knobs we set + a
-/// reserved tail). Verified by `const_assert!` below.
+/// oneVPL `mfxExtCodingOption3` — **512 bytes**, offsetof-verified on oneVPL
+/// 2.16: the only fields we set for 10-bit AV1 are `TargetChromaFormatPlus1`
+/// @158, `TargetBitDepthLuma` @160, `TargetBitDepthChroma` @162. The earlier
+/// layout put them at @58/60/62 (after 3 NumRef arrays) — wrong by 100 bytes,
+/// so 10-bit signalling never landed. We pad to the real offsets and leave the
+/// rest opaque (driver-blessed zero defaults).
 #[repr(C)]
 struct MfxExtCodingOption3 {
-    header: MfxExtBuffer,
-    num_ref_active_p: [u16; 8],
-    num_ref_active_bl0: [u16; 8],
-    num_ref_active_bl1: [u16; 8],
-    transform_skip: u16,
-    target_chroma_format_plus1: u16,
-    target_bit_depth_luma: u16,
-    target_bit_depth_chroma: u16,
-    brc_panic_mode: u16,
-    low_delay_brc: u16,
-    enable_mb_force_intra: u16,
-    adaptive_max_frame_size: u16,
-    repartition_check_enable: u16,
-    reserved5: [u16; 3],
-    encoded_units_info: u16,
-    enable_nal_unit_type: u16,
-    ext_brc_adaptive_ltr: u16,
-    adaptive_ltr: u16,
-    // Padded to the real 512-byte mfxExtCodingOption3. NOTE: the named fields
-    // above (TargetBitDepthLuma etc.) are NOT yet offset-verified against the
-    // real struct — only attached for 10-bit; verify before relying on 10-bit
-    // QSV. 8-bit jobs don't attach this buffer.
-    reserved6: [u16; 212],
+    header: MfxExtBuffer,             // @0 (8 bytes)
+    _pad_to_158: [u8; 150],          // @8 → @158
+    target_chroma_format_plus1: u16, // @158
+    target_bit_depth_luma: u16,      // @160
+    target_bit_depth_chroma: u16,    // @162
+    _tail: [u8; 348],                // @164 → @512
 }
 
 /// oneVPL `mfxExtVideoSignalInfo` — H.273 colour signalling carried
@@ -259,7 +227,6 @@ struct MfxEncodeCtrl {
 type MfxSession = *mut c_void;
 type MfxSyncPoint = *mut c_void;
 
-type FnMfxInit = unsafe extern "C" fn(u32, *mut MfxVersion, *mut MfxSession) -> MfxStatus;
 type FnMfxClose = unsafe extern "C" fn(MfxSession) -> MfxStatus;
 
 // oneVPL 2.x dispatcher (LIBVPL_2.0). AV1 lives in the `libmfx-gen` runtime,
@@ -663,24 +630,11 @@ impl QsvEncoder {
                             buffer_id: MFX_EXTBUFF_CODING_OPTION3,
                             buffer_sz: std::mem::size_of::<MfxExtCodingOption3>() as u32,
                         },
-                        num_ref_active_p: [0; 8],
-                        num_ref_active_bl0: [0; 8],
-                        num_ref_active_bl1: [0; 8],
-                        transform_skip: 0,
+                        _pad_to_158: [0; 150],
                         target_chroma_format_plus1: MFX_TARGET_CHROMAFORMAT_YUV420_PLUS1,
                         target_bit_depth_luma: 10,
                         target_bit_depth_chroma: 10,
-                        brc_panic_mode: 0,
-                        low_delay_brc: 0,
-                        enable_mb_force_intra: 0,
-                        adaptive_max_frame_size: 0,
-                        repartition_check_enable: 0,
-                        reserved5: [0; 3],
-                        encoded_units_info: 0,
-                        enable_nal_unit_type: 0,
-                        ext_brc_adaptive_ltr: 0,
-                        adaptive_ltr: 0,
-                        reserved6: [0; 212],
+                        _tail: [0; 348],
                     }))
                 } else {
                     None
@@ -2114,24 +2068,11 @@ mod tests {
                 buffer_id: MFX_EXTBUFF_CODING_OPTION3,
                 buffer_sz: std::mem::size_of::<MfxExtCodingOption3>() as u32,
             },
-            num_ref_active_p: [0; 8],
-            num_ref_active_bl0: [0; 8],
-            num_ref_active_bl1: [0; 8],
-            transform_skip: 0,
+            _pad_to_158: [0; 150],
             target_chroma_format_plus1: MFX_TARGET_CHROMAFORMAT_YUV420_PLUS1,
             target_bit_depth_luma: 10,
             target_bit_depth_chroma: 10,
-            brc_panic_mode: 0,
-            low_delay_brc: 0,
-            enable_mb_force_intra: 0,
-            adaptive_max_frame_size: 0,
-            repartition_check_enable: 0,
-            reserved5: [0; 3],
-            encoded_units_info: 0,
-            enable_nal_unit_type: 0,
-            ext_brc_adaptive_ltr: 0,
-            adaptive_ltr: 0,
-            reserved6: [0; 160],
+            _tail: [0; 348],
         };
 
         assert_eq!(co3.target_bit_depth_luma, 10, "AV1 BitDepth=10 in seq header");
@@ -2142,11 +2083,17 @@ mod tests {
         );
         assert_eq!(co3.header.buffer_id, MFX_EXTBUFF_CODING_OPTION3);
 
-        // 'C','D','O','3' LE → 0x33444f43.
-        assert_eq!(
-            MFX_EXTBUFF_CODING_OPTION3, 0x33444f43,
-            "ext buffer ID must match upstream MFX_MAKE_FOURCC('C','D','O','3')"
-        );
+        // offsetof-verified: TargetBitDepthLuma @160, TargetBitDepthChroma @162.
+        assert_eq!(memoffset_target_bit_depth_luma(), 160);
+        assert_eq!(MFX_EXTBUFF_CODING_OPTION3, 0x334f4443);
+    }
+
+    fn memoffset_target_bit_depth_luma() -> usize {
+        let base = std::mem::MaybeUninit::<MfxExtCodingOption3>::uninit();
+        let ptr = base.as_ptr();
+        unsafe {
+            (std::ptr::addr_of!((*ptr).target_bit_depth_luma) as usize) - (ptr as usize)
+        }
     }
 
     /// `mfxExtVideoSignalInfo` for HDR10 (BT.2020 NCL primaries, PQ

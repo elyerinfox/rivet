@@ -31,8 +31,7 @@ use crate::frame::{ColorSpace, PixelFormat, VideoFrame};
 use crate::qsv_ffi::{
     MFX_CHROMAFORMAT_YUV420, MFX_CODEC_AV1, MFX_CODEC_AVC, MFX_CODEC_HEVC, MFX_CODEC_VP9,
     MFX_ERR_MORE_DATA, MFX_ERR_MORE_SURFACE, MFX_ERR_NONE, MFX_FOURCC_NV12, MFX_FOURCC_P010,
-    MfxBitstream, MfxFrameData, MfxFrameInfo, MfxFrameSurface1, MfxInfoMfx, MfxSession, MfxStatus,
-    MfxSyncPoint, MfxVersion, MfxVideoParam,
+    MfxBitstream, MfxFrameSurface1, MfxSession, MfxStatus, MfxSyncPoint, MfxVersion, MfxVideoParam,
 };
 
 // decode-only constants
@@ -70,8 +69,6 @@ type FnMfxInit = unsafe extern "C" fn(u32, *mut MfxVersion, *mut MfxSession) -> 
 type FnMfxClose = unsafe extern "C" fn(MfxSession) -> MfxStatus;
 type FnDecodeHeader =
     unsafe extern "C" fn(MfxSession, *mut MfxBitstream, *mut MfxVideoParam) -> MfxStatus;
-type FnDecodeQueryIOSurf =
-    unsafe extern "C" fn(MfxSession, *mut MfxVideoParam, *mut MfxFrameAllocRequest) -> MfxStatus;
 type FnDecodeInit = unsafe extern "C" fn(MfxSession, *mut MfxVideoParam) -> MfxStatus;
 type FnDecodeClose = unsafe extern "C" fn(MfxSession) -> MfxStatus;
 type FnDecodeFrameAsync = unsafe extern "C" fn(
@@ -82,18 +79,6 @@ type FnDecodeFrameAsync = unsafe extern "C" fn(
     *mut MfxSyncPoint,
 ) -> MfxStatus;
 type FnSyncOperation = unsafe extern "C" fn(MfxSession, MfxSyncPoint, u32) -> MfxStatus;
-
-#[repr(C)]
-struct MfxFrameAllocRequest {
-    // Real oneVPL mfxFrameAllocRequest — 92 bytes (AllocId union @0, Info @16).
-    alloc_id: u32,
-    reserved3: [u32; 3],
-    info: MfxFrameInfo,
-    mem_type: u16,
-    num_frame_min: u16,
-    num_frame_suggested: u16,
-    reserved2: u16,
-}
 
 fn mfx_codec_for(codec_lower: &str) -> Option<u32> {
     Some(match codec_lower {
@@ -110,22 +95,12 @@ pub fn supports(codec_lower: &str) -> bool {
     mfx_codec_for(codec_lower).is_some()
 }
 
-/// A system-memory work surface + its backing buffer.
-struct WorkSurface {
-    surf: Box<MfxFrameSurface1>,
-    _backing: Vec<u8>,
-}
-
 pub struct QsvDecoder {
     info: StreamInfo,
     lib: libloading::Library,
     session: MfxSession,
-    surfaces: Vec<WorkSurface>,
     frames: VecDeque<VideoFrame>,
     ten_bit: bool,
-    width: usize,
-    height: usize,
-    pitch: usize,
     pending: Vec<u8>,
     inited: bool,
     codec_id: u32,
@@ -163,12 +138,8 @@ impl QsvDecoder {
                 info,
                 lib,
                 session,
-                surfaces: Vec::new(),
                 frames: VecDeque::new(),
                 ten_bit,
-                width: 0,
-                height: 0,
-                pitch: 0,
                 pending: Vec::new(),
                 inited: false,
                 codec_id,
@@ -185,8 +156,6 @@ impl QsvDecoder {
         unsafe {
             let decode_header: libloading::Symbol<FnDecodeHeader> =
                 self.lib.get(b"MFXVideoDECODE_DecodeHeader")?;
-            let query_iosurf: libloading::Symbol<FnDecodeQueryIOSurf> =
-                self.lib.get(b"MFXVideoDECODE_QueryIOSurf")?;
             let decode_init: libloading::Symbol<FnDecodeInit> =
                 self.lib.get(b"MFXVideoDECODE_Init")?;
 
@@ -220,40 +189,9 @@ impl QsvDecoder {
             }
             param.io_pattern = MFX_IOPATTERN_OUT_SYSTEM_MEMORY;
 
-            let w = param.mfx.frame_info.width.max(16) as usize;
-            let h = param.mfx.frame_info.height.max(16) as usize;
-
-            // Work-surface pool size. VERIFY: QueryIOSurf's suggested count vs the
-            // stream's actual DPB depth; we add a few for safety.
-            let mut req: MfxFrameAllocRequest = std::mem::zeroed();
-            let n = if query_iosurf(self.session, &mut param, &mut req) == MFX_ERR_NONE {
-                (req.num_frame_suggested as usize).max(4) + 4
-            } else {
-                8
-            };
-
-            // Allocate system-memory surfaces. Each plane is `pitch * h`; pitch
-            // is byte width (2× for 10-bit). NV12 has Y + interleaved UV.
-            let bytes_per = if self.ten_bit { 2 } else { 1 };
-            let pitch = w * bytes_per;
-            self.width = w;
-            self.height = h;
-            self.pitch = pitch;
-            let frame_bytes = pitch * h + pitch * h.div_ceil(2);
-            for _ in 0..n {
-                let mut backing = vec![0u8; frame_bytes];
-                let y = backing.as_mut_ptr();
-                let uv = backing.as_mut_ptr().add(pitch * h);
-                let mut surf: Box<MfxFrameSurface1> = Box::new(std::mem::zeroed());
-                surf.info = param.mfx.frame_info;
-                surf.data.y = y;
-                surf.data.u = uv;
-                surf.data.v = uv.add(bytes_per); // V interleaved right after U
-                surf.data.pitch = (pitch & 0xFFFF) as u16;
-                surf.data.pitch_high = (pitch >> 16) as u16;
-                self.surfaces.push(WorkSurface { surf, _backing: backing });
-            }
-
+            // No external work-surface pool: DecodeFrameAsync runs with
+            // surface_work=NULL (oneVPL 2.x internal allocation) and we read the
+            // returned surface via its FrameInterface::Map. Just Init.
             if decode_init(self.session, &mut param) < 0 {
                 bail!("MFXVideoDECODE_Init failed");
             }
@@ -263,16 +201,6 @@ impl QsvDecoder {
             self.inited = true;
         }
         Ok(())
-    }
-
-    /// A free (`Locked == 0`) work surface pointer, or null if the pool is dry.
-    fn free_surface(&mut self) -> *mut MfxFrameSurface1 {
-        for ws in &mut self.surfaces {
-            if ws.surf.data.locked == 0 {
-                return ws.surf.as_mut() as *mut MfxFrameSurface1;
-            }
-        }
-        ptr::null_mut()
     }
 
     /// Pump `self.pending` through DecodeFrameAsync, collecting decoded frames.
