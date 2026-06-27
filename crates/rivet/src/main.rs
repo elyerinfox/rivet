@@ -237,6 +237,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Stream a transcode: read media from **stdin**, write the AV1/MP4 to
+    /// **stdout** (source-resolution single-file defaults). For piping between
+    /// processes, e.g. `cat in.mkv | rivet pipe > out.mp4`.
+    Pipe,
+    /// Run a **Unix-domain-socket** IPC server (Unix only). Each connection: the
+    /// client writes media, half-closes its write side, then reads the
+    /// transcoded AV1/MP4 back. Lets another app stream data in and out without
+    /// HTTP or temp files.
+    Ipc {
+        /// Socket path to bind, e.g. `/tmp/rivet.sock`.
+        #[arg(long)]
+        socket: PathBuf,
+    },
     /// Run the HTTP transcode API server so another app can signal transcodes
     /// over the network (needs the `server` feature).
     #[cfg(feature = "server")]
@@ -322,6 +335,8 @@ fn run() -> Result<()> {
             capabilities_cmd(json);
             Ok(())
         }
+        Command::Pipe => pipe_cmd(),
+        Command::Ipc { socket } => ipc_cmd(&socket),
         #[cfg(feature = "server")]
         Command::Serve { addr } => {
             let addr: std::net::SocketAddr = addr.parse().context("parsing --addr")?;
@@ -813,4 +828,99 @@ fn capabilities_cmd(json: bool) {
             println!();
         }
     }
+}
+
+// ── `rivet pipe` — stdin → stdout streaming ────────────────────────
+
+fn pipe_cmd() -> Result<()> {
+    use std::io::{Read, Write};
+    let mut input = Vec::new();
+    std::io::stdin()
+        .lock()
+        .read_to_end(&mut input)
+        .context("reading media from stdin")?;
+    if input.is_empty() {
+        bail!("empty stdin — pipe media in, e.g. `cat in.mkv | rivet pipe > out.mp4`");
+    }
+    eprintln!("rivet pipe: {} bytes in, transcoding…", input.len());
+    let out = rivet::transcode_bytes(&input).context("transcoding stdin")?;
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(&out.output_bytes)
+        .context("writing AV1/MP4 to stdout")?;
+    stdout.flush().ok();
+    eprintln!(
+        "rivet pipe: {} frames → {} bytes out ({})",
+        out.frames_processed,
+        out.output_bytes.len(),
+        out.audio_handling.label()
+    );
+    Ok(())
+}
+
+// ── `rivet ipc` — Unix-domain-socket streaming server ──────────────
+
+#[cfg(unix)]
+fn ipc_cmd(socket: &Path) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    // Drop a stale socket from a previous run (ignore "not found").
+    let _ = std::fs::remove_file(socket);
+    let listener = UnixListener::bind(socket)
+        .with_context(|| format!("binding Unix socket {}", socket.display()))?;
+    eprintln!(
+        "rivet ipc: listening on {}\n           per connection: write media → half-close → read AV1/MP4 back\n           e.g.  socat - UNIX-CONNECT:{} < in.mkv > out.mp4",
+        socket.display(),
+        socket.display(),
+    );
+
+    fn handle(mut stream: UnixStream) {
+        let mut input = Vec::new();
+        if let Err(e) = stream.read_to_end(&mut input) {
+            eprintln!("rivet ipc: read error: {e}");
+            return;
+        }
+        if input.is_empty() {
+            return; // probe/keepalive connection
+        }
+        eprintln!("rivet ipc: {} bytes in", input.len());
+        match rivet::transcode_bytes(&input) {
+            Ok(out) => {
+                if let Err(e) = stream.write_all(&out.output_bytes) {
+                    eprintln!("rivet ipc: write error: {e}");
+                    return;
+                }
+                stream.flush().ok();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                eprintln!(
+                    "rivet ipc: {} frames → {} bytes out ({})",
+                    out.frames_processed,
+                    out.output_bytes.len(),
+                    out.audio_handling.label()
+                );
+            }
+            Err(e) => eprintln!("rivet ipc: transcode error: {e:#}"),
+        }
+    }
+
+    for stream in listener.incoming() {
+        match stream {
+            // One thread per connection; the process-wide GPU pool serializes
+            // the actual GPU work, so concurrent clients just queue on it.
+            Ok(s) => {
+                std::thread::spawn(move || handle(s));
+            }
+            Err(e) => eprintln!("rivet ipc: accept error: {e}"),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ipc_cmd(_socket: &Path) -> Result<()> {
+    bail!(
+        "`rivet ipc` (Unix-domain socket) is Unix-only. On Windows, use \
+         `rivet pipe` (stdin/stdout) or `rivet serve` (HTTP)."
+    )
 }
