@@ -1233,7 +1233,11 @@ impl QsvEncoder {
             // 2 MB bitstream buffer — plenty for 4K I-frame. Shared
             // across the ring; `SyncOperation` drains it between
             // frames.
-            let mut bitstream_buf: Box<[u8]> = vec![0u8; 2 * 1024 * 1024].into_boxed_slice();
+            // Size the output bitstream buffer to the raw frame size (an encoded
+            // AV1 frame is always smaller than raw), floored at 2 MiB. A fixed
+            // 2 MiB overflowed a 1080p IDR → MFX_ERR_NOT_ENOUGH_BUFFER (-5).
+            let bitstream_capacity = surface_bytes.max(2 * 1024 * 1024);
+            let mut bitstream_buf: Box<[u8]> = vec![0u8; bitstream_capacity].into_boxed_slice();
             let bitstream = MfxBitstream {
                 reserved: [0; 6],
                 decode_time_stamp: 0,
