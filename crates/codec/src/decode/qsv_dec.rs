@@ -46,11 +46,13 @@ const MFX_IOPATTERN_OUT_SYSTEM_MEMORY: u16 = 0x10;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MfxFrameInfo {
-    bit_depth_luma: u32,
-    bit_depth_chroma: u32,
+    // Real oneVPL mfxFrameInfo — 68 bytes (offsetof-verified). See encode/qsv.rs.
+    reserved: [u32; 4],
+    channel_id: u16,
+    bit_depth_luma: u16,
+    bit_depth_chroma: u16,
     shift: u16,
-    reserved_fi: [u16; 7],
-    frame_id: u64,
+    frame_id: [u16; 4],
     fourcc: u32,
     width: u16,
     height: u16,
@@ -58,7 +60,6 @@ struct MfxFrameInfo {
     crop_y: u16,
     crop_w: u16,
     crop_h: u16,
-    _crop_pad: [u16; 6],
     frame_rate_ext_n: u32,
     frame_rate_ext_d: u32,
     reserved3: u16,
@@ -72,10 +73,10 @@ struct MfxFrameInfo {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MfxInfoMfx {
-    reserved: [u32; 6],
-    low_power: u32,
+    // Real oneVPL mfxInfoMFX — 136 bytes. See encode/qsv.rs.
+    reserved: [u32; 7],
+    low_power: u16,
     brc_param_multiplier: u16,
-    _pad0: u16,
     frame_info: MfxFrameInfo,
     codec_id: u32,
     codec_profile: u16,
@@ -94,34 +95,41 @@ struct MfxInfoMfx {
     num_slice: u16,
     num_ref_frame: u16,
     encoded_order: u16,
-    _tail: [u32; 27],
 }
 
 #[repr(C)]
 struct MfxVideoParam {
+    // Real oneVPL mfxVideoParam — 208 bytes (mfx union is 168B). See encode/qsv.rs.
+    alloc_id: u32,
     reserved: [u32; 2],
     reserved3: u16,
     async_depth: u16,
     mfx: MfxInfoMfx,
+    _mfx_union_pad: [u8; 32],
     protected: u16,
     io_pattern: u16,
-    num_ext_param: u16,
-    _pad1: u16,
     ext_param: *mut *mut c_void,
-    _tail: [u32; 4],
+    num_ext_param: u16,
+    reserved2: u16,
 }
 
 #[repr(C)]
 struct MfxFrameData {
-    mem_id_or_y: *mut u8,
-    u: *mut u8,
-    v: *mut u8,
-    a: *mut u8,
-    pitch: u32,
+    // Real oneVPL mfxFrameData — 96 bytes; Y/U/V planes @48/@56/@64.
+    ext_param_or_reserved2: u64,
+    num_ext_param: u16,
+    reserved: [u16; 9],
+    mem_type: u16,
+    pitch_high: u16,
     time_stamp: u64,
     frame_order: u32,
     locked: u16,
-    reserved: [u16; 4],
+    pitch: u16,
+    y: *mut u8,
+    u: *mut u8,
+    v: *mut u8,
+    a: *mut u8,
+    mem_id: *mut c_void,
     corrupted: u16,
     data_flag: u16,
 }
@@ -177,7 +185,7 @@ type FnSyncOperation = unsafe extern "C" fn(MfxSession, MfxSyncPoint, u32) -> Mf
 
 #[repr(C)]
 struct MfxFrameAllocRequest {
-    reserved: [u32; 1],
+    // Real oneVPL mfxFrameAllocRequest — 92 bytes (AllocId union @0, Info @16).
     alloc_id: u32,
     reserved3: [u32; 3],
     info: MfxFrameInfo,
@@ -338,10 +346,11 @@ impl QsvDecoder {
                 let uv = backing.as_mut_ptr().add(pitch * h);
                 let mut surf: Box<MfxFrameSurface1> = Box::new(std::mem::zeroed());
                 surf.info = param.mfx.frame_info;
-                surf.data.mem_id_or_y = y;
+                surf.data.y = y;
                 surf.data.u = uv;
                 surf.data.v = uv.add(bytes_per); // V interleaved right after U
-                surf.data.pitch = pitch as u32;
+                surf.data.pitch = (pitch & 0xFFFF) as u16;
+                surf.data.pitch_high = (pitch >> 16) as u16;
                 self.surfaces.push(WorkSurface { surf, _backing: backing });
             }
 
@@ -428,9 +437,9 @@ impl QsvDecoder {
             let s = &*surf;
             let w = (s.info.crop_w.max(s.info.width)) as usize;
             let h = (s.info.crop_h.max(s.info.height)) as usize;
-            let pitch = s.data.pitch as usize;
+            let pitch = s.data.pitch as usize | ((s.data.pitch_high as usize) << 16);
             let ch = h.div_ceil(2);
-            let y_ptr = s.data.mem_id_or_y;
+            let y_ptr = s.data.y;
             let uv_ptr = s.data.u;
             if y_ptr.is_null() || uv_ptr.is_null() {
                 return None;
