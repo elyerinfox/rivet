@@ -9,10 +9,19 @@ Map) → QSV **AV1 encode** → **multi-GPU** chunk-and-stitch across all 3 card
 (struct layouts offsetof-verified, MFXLoad dispatcher, advisory Query, LowPower=ON,
 2 MiB→frame-sized bitstream buffer, crop-vs-coded dims, neutral-black NV12 padding
 for the green-bars/16-multiple issue). The mfx layouts are single-sourced in
-`crate::qsv_ffi`. **Remaining QSV polish**: 10-bit P010 path (CodingOption3 field
-offsets not yet offset-verified); confirm output pixel quality / no green bars on
-a non-16-multiple rung (e.g. 572-wide) by eye; the unused decode work-surface pool
-+ `free_surface` are now dead and can be deleted.
+`crate::qsv_ffi`. **QSV is complete** — the former polish items are all done
+(2026-06-27):
+- ✅ **10-bit P010**: HEVC Main10 → AV1 `yuv420p10le` verified end-to-end.
+  mfxExtCodingOption3 offsets corrected (TargetBitDepthLuma @160 etc.); the decoder
+  trusts DecodeHeader's output format (forcing P010 had broken Main10 Init).
+- ✅ **Non-16-multiple rung**: 572×240 (codes at 576×240) produces valid AV1; the
+  NV12/P010 scratch is neutral-black-filled so the cropped padding can't show as
+  green bars.
+- ✅ **Dead code removed**: decode work-surface pool / `free_surface` /
+  `MfxFrameAllocRequest` / QueryIOSurf (internal-alloc path) + the encoder's
+  MFXInit leftovers (MFX_MIN_VERSION/FnMfxInit) superseded by MFXLoad.
+
+Only nice-to-have left: by-eye QA of a real 4:2:2/odd-width source on a browser.
 
 ## AMD (AMF) hardware decode + encode — verify on RDNA-class silicon
 
