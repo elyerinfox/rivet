@@ -66,6 +66,16 @@ enum AudioArg {
     Drop,
 }
 
+impl From<AudioArg> for AudioPolicy {
+    fn from(a: AudioArg) -> Self {
+        match a {
+            AudioArg::Auto => AudioPolicy::Auto,
+            AudioArg::Opus => AudioPolicy::ForceOpus,
+            AudioArg::Drop => AudioPolicy::Drop,
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum GpuFamilyArg {
     Nvidia,
@@ -238,13 +248,43 @@ enum Command {
         json: bool,
     },
     /// Stream a transcode: read media from **stdin**, write the AV1/MP4 to
-    /// **stdout** (source-resolution single-file defaults). For piping between
-    /// processes, e.g. `cat in.mkv | rivet pipe > out.mp4`.
-    Pipe,
+    /// **stdout**. With no options it's the source-resolution single-file
+    /// default; the flags override quality/size/color/audio. E.g.
+    /// `cat in.mkv | rivet pipe --crf 28 --color hdr10 > out.mp4`.
+    Pipe {
+        /// Constant rate factor (lower = higher quality).
+        #[arg(long)]
+        crf: Option<u8>,
+        /// Encoder speed preset.
+        #[arg(long)]
+        speed: Option<u8>,
+        /// Audio policy.
+        #[arg(long, value_enum)]
+        audio: Option<AudioArg>,
+        /// Output color / tonemap policy.
+        #[arg(long, value_enum)]
+        color: Option<ColorArg>,
+        /// Output bit depth.
+        #[arg(long = "bit-depth", visible_alias = "pixel-format", value_enum)]
+        bit_depth: Option<PixelArg>,
+        /// Cap the output frame rate.
+        #[arg(long = "max-fps")]
+        max_fps: Option<f64>,
+        /// Output width (scales; defaults to source).
+        #[arg(long)]
+        width: Option<u32>,
+        /// Output height (scales; defaults to source).
+        #[arg(long)]
+        height: Option<u32>,
+        /// Pin encode to this GPU index.
+        #[arg(long)]
+        gpu: Option<u32>,
+    },
     /// Run a **Unix-domain-socket** IPC server (Unix only). Each connection: the
     /// client writes media, half-closes its write side, then reads the
-    /// transcoded AV1/MP4 back. Lets another app stream data in and out without
-    /// HTTP or temp files.
+    /// transcoded AV1/MP4 back. Per-job settings can prefix the stream as a
+    /// `#rivet key=value …\n` header line. Lets an app stream data in and out
+    /// without HTTP or temp files.
     Ipc {
         /// Socket path to bind, e.g. `/tmp/rivet.sock`.
         #[arg(long)]
@@ -335,7 +375,27 @@ fn run() -> Result<()> {
             capabilities_cmd(json);
             Ok(())
         }
-        Command::Pipe => pipe_cmd(),
+        Command::Pipe {
+            crf,
+            speed,
+            audio,
+            color,
+            bit_depth,
+            max_fps,
+            width,
+            height,
+            gpu,
+        } => pipe_cmd(JobSettings {
+            crf,
+            speed,
+            audio: audio.map(Into::into),
+            color: color.map(Into::into),
+            bit_depth: bit_depth.map(Into::into),
+            max_fps,
+            width,
+            height,
+            gpu,
+        }),
         Command::Ipc { socket } => ipc_cmd(&socket),
         #[cfg(feature = "server")]
         Command::Serve { addr } => {
@@ -830,9 +890,146 @@ fn capabilities_cmd(json: bool) {
     }
 }
 
+// ── streaming transcode settings (shared by `pipe` flags / `ipc` header) ──
+
+/// Per-job settings for the streaming paths. All-`None` keeps the single-file
+/// default (fast `transcode_bytes` path); any set field routes through the full
+/// `run_job` single-file engine (scale / color / bit-depth / quality / audio /
+/// gpu). `pipe` fills this from CLI flags; `ipc` from a `#rivet k=v …` header.
+#[derive(Default, Clone)]
+struct JobSettings {
+    crf: Option<u8>,
+    speed: Option<u8>,
+    audio: Option<AudioPolicy>,
+    color: Option<ColorPolicy>,
+    bit_depth: Option<BitDepth>,
+    max_fps: Option<f64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    gpu: Option<u32>,
+}
+
+impl JobSettings {
+    fn is_empty(&self) -> bool {
+        self.crf.is_none()
+            && self.speed.is_none()
+            && self.audio.is_none()
+            && self.color.is_none()
+            && self.bit_depth.is_none()
+            && self.max_fps.is_none()
+            && self.width.is_none()
+            && self.height.is_none()
+            && self.gpu.is_none()
+    }
+
+    /// Parse a `key=value key=value …` line (the `rivet ipc` header body).
+    fn parse_kv(line: &str) -> Result<Self> {
+        let mut s = Self::default();
+        for tok in line.split_whitespace() {
+            let (k, v) = tok
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("bad setting '{tok}' (expected key=value)"))?;
+            match k {
+                "crf" => s.crf = Some(v.parse().context("crf")?),
+                "speed" => s.speed = Some(v.parse().context("speed")?),
+                "audio" => {
+                    s.audio = Some(match v {
+                        "auto" => AudioPolicy::Auto,
+                        "opus" => AudioPolicy::ForceOpus,
+                        "drop" => AudioPolicy::Drop,
+                        o => bail!("audio must be auto|opus|drop, got '{o}'"),
+                    })
+                }
+                "color" => {
+                    s.color = Some(match v {
+                        "sdr" => ColorPolicy::TonemapToSdr,
+                        "hdr10" => ColorPolicy::Hdr10,
+                        "hlg" => ColorPolicy::Hlg,
+                        "passthrough" => ColorPolicy::Passthrough,
+                        o => bail!("color must be sdr|hdr10|hlg|passthrough, got '{o}'"),
+                    })
+                }
+                "bit-depth" | "pixel-format" => {
+                    s.bit_depth = Some(match v {
+                        "auto" => BitDepth::Auto,
+                        "8bit" => BitDepth::EightBit,
+                        "10bit" => BitDepth::TenBit,
+                        o => bail!("bit-depth must be auto|8bit|10bit, got '{o}'"),
+                    })
+                }
+                "max-fps" => s.max_fps = Some(v.parse().context("max-fps")?),
+                "width" => s.width = Some(v.parse().context("width")?),
+                "height" => s.height = Some(v.parse().context("height")?),
+                "gpu" => s.gpu = Some(v.parse().context("gpu")?),
+                o => bail!(
+                    "unknown setting '{o}' (crf/speed/audio/color/bit-depth/max-fps/width/height/gpu)"
+                ),
+            }
+        }
+        Ok(s)
+    }
+
+    /// Build a single-file `OutputSpec` from these settings, run it, and return
+    /// `(mp4_bytes, frames, audio_label)`.
+    fn run(&self, input: &[u8]) -> Result<(Vec<u8>, u64, String)> {
+        let probed = rivet::probe_bytes(input).context("probing input")?;
+        let w = self.width.unwrap_or(probed.width);
+        let h = self.height.unwrap_or(probed.height);
+        if w == 0 || h == 0 {
+            bail!("could not determine output size from the source — set width=/height=");
+        }
+        let quality = Quality {
+            crf: self.crf,
+            speed_preset: self.speed,
+            ..Default::default()
+        };
+        let mut spec = OutputSpec::single_file(vec![Rung::new(w, h).with_quality(quality)]);
+        if let Some(a) = self.audio {
+            spec.audio = a;
+        }
+        spec.max_frame_rate = self.max_fps;
+        if let Some(g) = self.gpu {
+            spec = spec.encode_policy(EncodePolicy::SingleGpu(Some(g)));
+        }
+        if let Some(c) = self.color {
+            spec = spec.with_color(c);
+        }
+        if let Some(b) = self.bit_depth {
+            spec = spec.with_bit_depth(b);
+        }
+        spec.validate().context("invalid settings")?;
+        let sink = Arc::new(rivet::fn_sink(|_p: RungProgress| {}));
+        let out = rivet::run_job_blocking(input, &spec, None, sink).context("transcoding")?;
+        let audio = out.audio_handling.clone();
+        for r in out.rungs {
+            let frames = r.frames;
+            if let rivet::RungArtifact::File(bytes) = r.artifact {
+                return Ok((bytes, frames, audio));
+            }
+        }
+        bail!("no single-file output produced")
+    }
+}
+
+/// Transcode `input` honoring `settings`: all-default settings take the fast
+/// `transcode_bytes` path; any set field routes through the full `run_job`
+/// single-file engine. Returns `(mp4_bytes, frames, audio_label)`.
+fn stream_transcode(input: &[u8], settings: &JobSettings) -> Result<(Vec<u8>, u64, String)> {
+    if settings.is_empty() {
+        let out = rivet::transcode_bytes(input).context("transcoding")?;
+        Ok((
+            out.output_bytes,
+            out.frames_processed,
+            out.audio_handling.label(),
+        ))
+    } else {
+        settings.run(input)
+    }
+}
+
 // ── `rivet pipe` — stdin → stdout streaming ────────────────────────
 
-fn pipe_cmd() -> Result<()> {
+fn pipe_cmd(settings: JobSettings) -> Result<()> {
     use std::io::{Read, Write};
     let mut input = Vec::new();
     std::io::stdin()
@@ -843,22 +1040,33 @@ fn pipe_cmd() -> Result<()> {
         bail!("empty stdin — pipe media in, e.g. `cat in.mkv | rivet pipe > out.mp4`");
     }
     eprintln!("rivet pipe: {} bytes in, transcoding…", input.len());
-    let out = rivet::transcode_bytes(&input).context("transcoding stdin")?;
+    let (bytes, frames, audio) = stream_transcode(&input, &settings)?;
     let mut stdout = std::io::stdout().lock();
-    stdout
-        .write_all(&out.output_bytes)
-        .context("writing AV1/MP4 to stdout")?;
+    stdout.write_all(&bytes).context("writing AV1/MP4 to stdout")?;
     stdout.flush().ok();
-    eprintln!(
-        "rivet pipe: {} frames → {} bytes out ({})",
-        out.frames_processed,
-        out.output_bytes.len(),
-        out.audio_handling.label()
-    );
+    eprintln!("rivet pipe: {frames} frames → {} bytes out ({audio})", bytes.len());
     Ok(())
 }
 
 // ── `rivet ipc` — Unix-domain-socket streaming server ──────────────
+
+/// Split an optional `#rivet key=value …\n` settings header off the front of
+/// the stream. Real container magic bytes never start with `#rivet`, so this is
+/// unambiguous. Returns the parsed settings and the remaining media slice.
+#[cfg(unix)]
+fn split_ipc_settings(input: &[u8]) -> (Result<JobSettings>, &[u8]) {
+    const MAGIC: &[u8] = b"#rivet";
+    if input.starts_with(MAGIC) {
+        let nl = input.iter().position(|&b| b == b'\n').unwrap_or(input.len());
+        let media_start = (nl + 1).min(input.len());
+        let line = std::str::from_utf8(&input[MAGIC.len()..nl])
+            .map(str::trim)
+            .unwrap_or("");
+        (JobSettings::parse_kv(line), &input[media_start..])
+    } else {
+        (Ok(JobSettings::default()), input)
+    }
+}
 
 #[cfg(unix)]
 fn ipc_cmd(socket: &Path) -> Result<()> {
@@ -870,7 +1078,7 @@ fn ipc_cmd(socket: &Path) -> Result<()> {
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("binding Unix socket {}", socket.display()))?;
     eprintln!(
-        "rivet ipc: listening on {}\n           per connection: write media → half-close → read AV1/MP4 back\n           e.g.  socat - UNIX-CONNECT:{} < in.mkv > out.mp4",
+        "rivet ipc: listening on {}\n           per connection: [optional `#rivet k=v …\\n` header] media → half-close → read AV1/MP4 back\n           e.g.  socat - UNIX-CONNECT:{} < in.mkv > out.mp4",
         socket.display(),
         socket.display(),
     );
@@ -884,21 +1092,24 @@ fn ipc_cmd(socket: &Path) -> Result<()> {
         if input.is_empty() {
             return; // probe/keepalive connection
         }
-        eprintln!("rivet ipc: {} bytes in", input.len());
-        match rivet::transcode_bytes(&input) {
-            Ok(out) => {
-                if let Err(e) = stream.write_all(&out.output_bytes) {
+        let (settings, media) = split_ipc_settings(&input);
+        let settings = match settings {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("rivet ipc: bad settings header: {e:#}");
+                return;
+            }
+        };
+        eprintln!("rivet ipc: {} media bytes in", media.len());
+        match stream_transcode(media, &settings) {
+            Ok((bytes, frames, audio)) => {
+                if let Err(e) = stream.write_all(&bytes) {
                     eprintln!("rivet ipc: write error: {e}");
                     return;
                 }
                 stream.flush().ok();
                 let _ = stream.shutdown(std::net::Shutdown::Write);
-                eprintln!(
-                    "rivet ipc: {} frames → {} bytes out ({})",
-                    out.frames_processed,
-                    out.output_bytes.len(),
-                    out.audio_handling.label()
-                );
+                eprintln!("rivet ipc: {frames} frames → {} bytes out ({audio})", bytes.len());
             }
             Err(e) => eprintln!("rivet ipc: transcode error: {e:#}"),
         }
