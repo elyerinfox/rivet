@@ -38,6 +38,8 @@ rgb = { version = "0.8", optional = true }
 axum = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+serde_yaml_ng = { version = "0.10", optional = true }
+glob = { version = "0.3", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 
 [dev-dependencies]
@@ -74,3 +76,6 @@ server = ["dep:axum", "dep:serde", "dep:serde_json", "dep:uuid", "tokio/net"]
 # Windows the command exists but reports use `pipe`/`serve`). The `pipe`
 # stdin/stdout streaming path is always available and needs no feature.
 ipc = []
+# `rivet batch`: a YAML/JSON manifest DSL for converting many files in one run.
+# Pulls serde + a YAML/JSON parser + glob. See docs/batch.md.
+batch = ["dep:serde", "dep:serde_json", "dep:serde_yaml_ng", "dep:glob"]

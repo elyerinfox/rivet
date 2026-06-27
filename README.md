@@ -25,8 +25,8 @@ backend behind a feature flag).
 [Pipeline](docs/pipeline.md) (data flow), the per-crate references
 ([codec decode](docs/codec-decode.md) · [codec encode](docs/codec-encode.md) ·
 [container](docs/container.md) · [engine](docs/engine.md)), and the usage guides
-([OutputSpec](docs/output-spec.md) · [CLI](docs/cli.md) · [HTTP API](docs/api.md)).
-This README is the quick tour.
+([OutputSpec](docs/output-spec.md) · [Batch manifest](docs/batch.md) ·
+[CLI](docs/cli.md) · [HTTP API](docs/api.md)). This README is the quick tour.
 
 ## Why "rivet"
 
@@ -265,6 +265,10 @@ rivet capabilities [--json]   # what this build can encode/decode (alias: caps)
 cat input.mkv | rivet pipe > output.mp4                       # stdin → stdout (cross-platform)
 cat input.mkv | rivet pipe --crf 28 --width 1280 --height 720 > out.mp4  # with settings
 rivet ipc --socket /tmp/rivet.sock           # Unix-socket server; clients prefix a `#rivet k=v` header
+
+# Convert many files from a YAML/JSON manifest (feature `batch`) — see docs/batch.md
+rivet batch jobs.yaml --dry-run     # preview the plan
+rivet batch jobs.yaml               # run it
 ```
 
 GPU selection (mirrors `EncodePolicy` / `decode_gpu`):

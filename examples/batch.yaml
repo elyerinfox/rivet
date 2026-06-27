@@ -1,0 +1,38 @@
+# rivet batch manifest — example. Run with: rivet batch examples/batch.yaml
+# (build with `--features batch`). See docs/batch.md for the full DSL.
+#
+# Relative paths resolve against this file's directory.
+
+output_dir: out            # base dir for jobs that omit `output`
+on_error: continue         # continue (default) | stop
+
+defaults:                  # applied to every job; any job can override per field
+  crf: 28
+  color: sdr               # tonemap HDR sources down to 8-bit SDR
+  audio: auto              # AAC/Opus passthrough, MP3/Vorbis -> Opus
+
+jobs:
+  # 1) a single file -> a single MP4, with a per-job quality override
+  - input: in/movie.mkv
+    output: out/movie.mp4
+    crf: 24
+
+  # 2) one file -> a segmented HLS package (a directory) with an ABR ladder
+  - input: in/promo.mov
+    output: out/promo        # directory = HLS asset root
+    mode: hls
+    ladder: true
+    max_short_side: 1080
+    segment_seconds: 4
+
+  # 3) a glob -> one job per match; each file -> out/<name>.mp4 (trailing slash)
+  - input: "clips/*.mp4"
+    output: out/
+    crf: 30
+
+  # 4) scale a single output + force HDR10 (needs a 10-bit encoder)
+  - input: in/hdr_source.mov
+    output: out/hdr_720p.mp4
+    width: 1280
+    height: 720
+    color: hdr10

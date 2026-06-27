@@ -3,10 +3,11 @@
 > What happens under the hood for any of these commands — demux → decode-once
 > pump → multi-GPU encode → mux — is in [pipeline & architecture](pipeline.md).
 
-The `rivet` binary has seven subcommands: [`transcode`](#rivet-transcode),
+The `rivet` binary has these subcommands: [`transcode`](#rivet-transcode),
 [`probe`](#rivet-probe), [`devices`](#rivet-devices),
 [`capabilities`](#rivet-capabilities), [`pipe`](#rivet-pipe),
-[`ipc`](#rivet-ipc), and [`serve`](#rivet-serve). Build it with:
+[`batch`](#rivet-batch) (feature `batch`), [`ipc`](#rivet-ipc) (feature `ipc`),
+and [`serve`](#rivet-serve) (feature `server`). Build it with:
 
 ```sh
 cargo build --release                     # CPU/GPU decode + GPU encode tiers
@@ -228,6 +229,39 @@ ffmpeg -i src.mov -f matroska - | rivet pipe --color hdr10 | ./my-uploader
 Single MP4 only — for an HLS package or a multi-rung ladder use
 [`transcode`](#rivet-transcode) with a directory output, or the
 [HTTP API](api.md).
+
+## `rivet batch`
+
+```
+cargo build --release --features batch   # opt-in
+rivet batch <MANIFEST> [--dry-run] [--stop-on-error]
+```
+
+Convert **many files in one run** from a YAML or JSON **manifest** — you list the
+files (and how), rivet does them. Each job is an input (file or glob), an output,
+and any transcode setting, on top of optional shared `defaults`. `--dry-run`
+parses + expands globs + lists the planned jobs without converting; `--stop-on-error`
+aborts on the first failure (default keeps going and exits non-zero if any failed).
+
+```sh
+rivet batch jobs.yaml --dry-run
+rivet batch jobs.yaml
+```
+
+```yaml
+output_dir: out
+defaults: { crf: 28, color: sdr }
+jobs:
+  - input: in/a.mkv
+    output: out/a.mp4
+    crf: 24
+  - input: "clips/*.mp4"   # glob -> one job per file -> out/<name>.mp4
+    output: out/
+```
+
+**Full DSL reference: [batch.md](batch.md)** — every key, the output-path rules,
+glob inputs, defaults merge, and JSON examples. A ready-to-edit manifest is in
+[`examples/batch.yaml`](../examples/batch.yaml) / [`.json`](../examples/batch.json).
 
 ## `rivet ipc`
 

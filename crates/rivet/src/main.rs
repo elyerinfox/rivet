@@ -288,6 +288,19 @@ enum Command {
         #[arg(long)]
         socket: PathBuf,
     },
+    /// Convert many files from a YAML/JSON **manifest** in one run (needs the
+    /// `batch` feature). See `docs/batch.md` for the DSL.
+    #[cfg(feature = "batch")]
+    Batch {
+        /// Manifest path (.yaml / .yml / .json).
+        manifest: PathBuf,
+        /// Parse + validate + list the planned jobs without converting anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Abort on the first failed job (overrides the manifest's `on_error`).
+        #[arg(long)]
+        stop_on_error: bool,
+    },
     /// Run the HTTP transcode API server so another app can signal transcodes
     /// over the network (needs the `server` feature).
     #[cfg(feature = "server")]
@@ -397,6 +410,12 @@ fn run() -> Result<()> {
         }),
         #[cfg(feature = "ipc")]
         Command::Ipc { socket } => ipc_cmd(&socket),
+        #[cfg(feature = "batch")]
+        Command::Batch {
+            manifest,
+            dry_run,
+            stop_on_error,
+        } => batch_cmd(&manifest, dry_run, stop_on_error),
         #[cfg(feature = "server")]
         Command::Serve { addr } => {
             let addr: std::net::SocketAddr = addr.parse().context("parsing --addr")?;
@@ -1011,4 +1030,76 @@ fn ipc_cmd(_socket: &Path) -> Result<()> {
         "`rivet ipc` (Unix-domain socket) is Unix-only. On Windows, use \
          `rivet pipe` (stdin/stdout) or `rivet serve` (HTTP)."
     )
+}
+
+// ── `rivet batch` — YAML/JSON manifest of conversions ──────────────
+
+#[cfg(feature = "batch")]
+fn batch_cmd(manifest_path: &Path, dry_run: bool, stop_on_error: bool) -> Result<()> {
+    use rivet::manifest;
+
+    let text = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
+    let mut m = manifest::parse_manifest(&text, manifest::Format::from_path(manifest_path))?;
+    if stop_on_error {
+        m.on_error = Some("stop".into());
+    }
+    let base = manifest_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+
+    if dry_run {
+        let planned = manifest::plan_manifest(&m, &base)?;
+        eprintln!("batch dry-run: {} job(s) planned\n", planned.len());
+        for (i, job) in planned.iter().enumerate() {
+            let s = &job.spec;
+            let mode = s.mode.as_deref().unwrap_or("single");
+            let mut bits = vec![format!("mode={mode}")];
+            if s.ladder == Some(true) {
+                bits.push("ladder".into());
+            }
+            if let Some(r) = &s.rungs {
+                bits.push(format!("rungs={}", r.join(",")));
+            }
+            if let Some(c) = s.crf {
+                bits.push(format!("crf={c}"));
+            }
+            if let Some(c) = &s.color {
+                bits.push(format!("color={c}"));
+            }
+            if let Some(o) = &s.output {
+                bits.push(format!("output={o}"));
+            }
+            eprintln!("  [{}] {}  ({})", i + 1, job.input.display(), bits.join(" "));
+        }
+        eprintln!("\n(dry run — nothing converted)");
+        return Ok(());
+    }
+
+    let report = manifest::run_manifest(&m, &base)?;
+
+    println!(
+        "\nbatch: {} ok, {} failed (of {})",
+        report.ok_count(),
+        report.failed_count(),
+        report.outcomes.len()
+    );
+    for o in &report.outcomes {
+        match &o.status {
+            manifest::JobStatus::Ok => println!(
+                "  ok    {} -> {}",
+                o.input.display(),
+                o.output.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+            ),
+            manifest::JobStatus::Failed(e) => {
+                println!("  FAIL  {}: {}", o.input.display(), e)
+            }
+        }
+    }
+    if !report.all_ok() {
+        bail!("{} job(s) failed", report.failed_count());
+    }
+    Ok(())
 }

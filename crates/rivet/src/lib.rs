@@ -46,6 +46,9 @@ pub mod frame_queue;
 pub mod gpu_pool;
 pub mod job;
 pub mod ladder;
+/// Batch manifest DSL (YAML/JSON), opt-in `batch` feature.
+#[cfg(feature = "batch")]
+pub mod manifest;
 pub mod multigpu;
 pub mod probe;
 pub mod progress;
@@ -72,6 +75,10 @@ pub use ladder::standard_ladder;
 pub use multigpu::{MultiGpuParams, RungManifest, detect_gpu_pool, run_multigpu_hls};
 pub use probe::{AudioStreamInfo, MediaInfo, probe_bytes, probe_file};
 pub use progress::{JobEvent, ProgressSink, RungProgress, RungStatus, channel_sink, fn_sink};
+#[cfg(feature = "batch")]
+pub use manifest::{
+    BatchReport, Format as ManifestFormat, JobOutcome, JobStatus, Manifest, run_manifest_file,
+};
 pub use settings::{Mode, TranscodeSettings};
 pub use spec::{
     AudioPolicy, BitDepth, ColorPolicy, Container, EncodePolicy, GpuFamily, Muxer, OutputMode,

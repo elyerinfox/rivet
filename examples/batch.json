@@ -1,0 +1,28 @@
+{
+  "output_dir": "out",
+  "on_error": "continue",
+  "defaults": {
+    "crf": 28,
+    "color": "sdr",
+    "audio": "auto"
+  },
+  "jobs": [
+    { "input": "in/movie.mkv", "output": "out/movie.mp4", "crf": 24 },
+    {
+      "input": "in/promo.mov",
+      "output": "out/promo",
+      "mode": "hls",
+      "ladder": true,
+      "max_short_side": 1080,
+      "segment_seconds": 4
+    },
+    { "input": "clips/*.mp4", "output": "out/", "crf": 30 },
+    {
+      "input": "in/hdr_source.mov",
+      "output": "out/hdr_720p.mp4",
+      "width": 1280,
+      "height": 720,
+      "color": "hdr10"
+    }
+  ]
+}
