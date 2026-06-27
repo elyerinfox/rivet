@@ -3,8 +3,9 @@
 > What happens under the hood for any of these commands — demux → decode-once
 > pump → multi-GPU encode → mux — is in [pipeline & architecture](pipeline.md).
 
-The `rivet` binary has three subcommands: [`transcode`](#rivet-transcode),
-[`probe`](#rivet-probe), and [`serve`](#rivet-serve). Build it with:
+The `rivet` binary has five subcommands: [`transcode`](#rivet-transcode),
+[`probe`](#rivet-probe), [`devices`](#rivet-devices),
+[`capabilities`](#rivet-capabilities), and [`serve`](#rivet-serve). Build it with:
 
 ```sh
 cargo build --release                     # CPU/GPU decode + GPU encode tiers
@@ -150,6 +151,55 @@ summary is printed.
 ```sh
 rivet probe input.mkv
 rivet probe input.mkv --json
+```
+
+---
+
+## `rivet devices`
+
+```
+rivet devices [--json]
+```
+
+List the GPUs rivet detects on this host — vendor, name, generation, VRAM, PCI
+address, and (NVIDIA only, via NVML) a live load snapshot (GPU / encoder /
+decoder utilization, memory, temperature). `--json` emits
+`{ "gpus": [ { index, vendor, name, generation, vram_mib, pci, load? } ] }`.
+
+```sh
+rivet devices
+rivet devices --json
+```
+
+This is **hardware inventory** — what's plugged in. What this *build* can actually
+do with it is [`rivet capabilities`](#rivet-capabilities) (it depends on which
+GPU feature the binary was compiled with).
+
+## `rivet capabilities` (alias `caps`)
+
+```
+rivet capabilities [--json]
+rivet caps [--json]
+```
+
+Report what this **build + host** can do:
+
+- **Encode** — AV1 4:2:0 (the only output codec): the compiled backends
+  (`nvenc` / `amf` / `qsv` / `ffmpeg`), the max bit depth (8 or 10), and whether
+  HDR (PQ/HLG, BT.2020) is producible. Driven by `codec::encode::build_output_caps()`
+  — the same query `OutputSpec::validate()` consults.
+- **Decode** — a codec → backends table (which of `nvdec` / `amf` / `qsv` /
+  `ffmpeg` decode `h264` / `hevc` / `vp8` / `vp9` / `av1` / `mpeg2` / `mpeg4` /
+  `prores`).
+- **Devices** — a one-line summary of the detected GPUs.
+
+A backend only appears if its **feature was compiled in** (`--features nvidia`
+etc.); the actual silicon (e.g. NVENC AV1 needs Ada+) is verified at encode time.
+
+```sh
+cargo build --release --features qsv
+rivet capabilities            # Encode: qsv 10-bit HDR · Decode: h264/hevc/av1/vp9 → qsv
+rivet caps --json
 ```
 
 ---

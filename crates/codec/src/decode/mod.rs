@@ -184,6 +184,67 @@ fn nvdec_supports(codec_lower: &str) -> bool {
     )
 }
 
+/// Decode backends compiled into this build, in dispatch-preference order.
+pub fn decode_backends() -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if cfg!(feature = "ffmpeg") {
+        v.push("ffmpeg");
+    }
+    if cfg!(feature = "nvidia") {
+        v.push("nvdec");
+    }
+    if cfg!(feature = "amd") {
+        v.push("amf");
+    }
+    if cfg!(feature = "qsv") {
+        v.push("qsv");
+    }
+    v
+}
+
+/// One codec's decode support across the compiled backends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeSupport {
+    /// Canonical codec label, e.g. `"h264"`.
+    pub codec: &'static str,
+    /// Backend names that can decode it in this build (`"nvdec"`, `"amf"`,
+    /// `"qsv"`, `"ffmpeg"`). Empty = this build can't decode it.
+    pub backends: Vec<&'static str>,
+}
+
+/// Which compiled backends decode each common codec, for `rivet capabilities`.
+pub fn decode_capabilities() -> Vec<DecodeSupport> {
+    const CODECS: &[&str] = &[
+        "h264", "hevc", "vp8", "vp9", "av1", "mpeg2", "mpeg4", "prores",
+    ];
+    // ffmpeg's software/hwaccel catalogue covers all of these.
+    const FFMPEG: &[&str] = CODECS;
+    CODECS
+        .iter()
+        .map(|&codec| {
+            let mut backends: Vec<&'static str> = Vec::new();
+            #[cfg(feature = "ffmpeg")]
+            if FFMPEG.contains(&codec) {
+                backends.push("ffmpeg");
+            }
+            #[cfg(feature = "nvidia")]
+            if nvdec_supports(codec) {
+                backends.push("nvdec");
+            }
+            #[cfg(feature = "amd")]
+            if amf_dec::supports(codec) {
+                backends.push("amf");
+            }
+            #[cfg(feature = "qsv")]
+            if qsv_dec::supports(codec) {
+                backends.push("qsv");
+            }
+            let _ = FFMPEG;
+            DecodeSupport { codec, backends }
+        })
+        .collect()
+}
+
 /// Construct a hardware decoder for `codec`. NVIDIA GPUs win on tie
 /// when both vendors are present (NVDEC is generally lower-latency on
 /// the standard codec set + is what the production fleet has been

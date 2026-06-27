@@ -223,6 +223,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List detected GPU devices (vendor, name, VRAM, AV1-encode, live load).
+    Devices {
+        /// Emit machine-readable JSON instead of a human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report what this build + host can do: enabled backends, encode/decode
+    /// codec support, and the detected devices.
+    #[command(visible_alias = "caps")]
+    Capabilities {
+        /// Emit machine-readable JSON instead of a human summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the HTTP transcode API server so another app can signal transcodes
     /// over the network (needs the `server` feature).
     #[cfg(feature = "server")]
@@ -298,6 +312,14 @@ fn run() -> Result<()> {
             } else {
                 print_probe(&input, &info);
             }
+            Ok(())
+        }
+        Command::Devices { json } => {
+            devices_cmd(json);
+            Ok(())
+        }
+        Command::Capabilities { json } => {
+            capabilities_cmd(json);
             Ok(())
         }
         #[cfg(feature = "server")]
@@ -616,4 +638,179 @@ fn probe_json(info: &rivet::MediaInfo) -> String {
 
 fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+// ── `rivet devices` ────────────────────────────────────────────────
+
+fn devices_cmd(json: bool) {
+    let devices = codec::gpu::detect_gpus();
+    if json {
+        println!("{}", devices_json(&devices));
+        return;
+    }
+    if devices.is_empty() {
+        println!(
+            "No GPUs detected (CPU-only host). GPU transcode needs a `nvidia` / `amd` / `qsv` \
+             feature build with the matching hardware; the `ffmpeg` feature provides software."
+        );
+        return;
+    }
+    let util = codec::gpu::GpuUtilizationReader::new();
+    println!("{} GPU(s) detected:\n", devices.len());
+    for d in &devices {
+        println!(
+            "  [{}] {} {}",
+            d.index,
+            codec::gpu::manufacturer_label(d.vendor),
+            d.name
+        );
+        println!("      generation : {}", d.generation);
+        if d.vram_mib > 0 {
+            println!("      VRAM       : {} MiB", d.vram_mib);
+        }
+        println!("      PCI        : {}", d.host_pci_address);
+        // Live load is read via NVML — meaningful on NVIDIA only.
+        if matches!(d.vendor, codec::gpu::GpuVendor::Nvidia) {
+            let u = util.read(d);
+            print!(
+                "      load       : gpu {}% · enc {}% · dec {}% · mem {}/{} MiB",
+                u.util_percent, u.encoder_percent, u.decoder_percent, u.mem_used_mib, u.mem_total_mib
+            );
+            if let Some(t) = u.temperature_c {
+                print!(" · {t}°C");
+            }
+            println!();
+        }
+        println!();
+    }
+    println!("Run `rivet capabilities` for what this build can encode/decode.");
+}
+
+fn devices_json(devices: &[codec::gpu::GpuDevice]) -> String {
+    let util = codec::gpu::GpuUtilizationReader::new();
+    let items: Vec<String> = devices
+        .iter()
+        .map(|d| {
+            let load = if matches!(d.vendor, codec::gpu::GpuVendor::Nvidia) {
+                let u = util.read(d);
+                let temp = u
+                    .temperature_c
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "null".into());
+                format!(
+                    ",\"load\":{{\"gpu_percent\":{},\"encoder_percent\":{},\"decoder_percent\":{},\"mem_used_mib\":{},\"mem_total_mib\":{},\"temperature_c\":{}}}",
+                    u.util_percent, u.encoder_percent, u.decoder_percent, u.mem_used_mib, u.mem_total_mib, temp
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "{{\"index\":{},\"vendor\":\"{}\",\"name\":\"{}\",\"generation\":\"{}\",\"vram_mib\":{},\"pci\":\"{}\"{}}}",
+                d.index,
+                codec::gpu::manufacturer_label(d.vendor),
+                esc(&d.name),
+                esc(&d.generation),
+                d.vram_mib,
+                esc(&d.host_pci_address),
+                load
+            )
+        })
+        .collect();
+    format!("{{\"gpus\":[{}]}}", items.join(","))
+}
+
+// ── `rivet capabilities` ───────────────────────────────────────────
+
+fn capabilities_cmd(json: bool) {
+    let enc = codec::encode::encode_backends();
+    let dec_backends = codec::decode::decode_backends();
+    let caps = codec::encode::build_output_caps();
+    let dec = codec::decode::decode_capabilities();
+    let devices = codec::gpu::detect_gpus();
+
+    if json {
+        let enc_b = enc
+            .iter()
+            .map(|b| format!("\"{b}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let dec_b = dec_backends
+            .iter()
+            .map(|b| format!("\"{b}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let codecs = dec
+            .iter()
+            .map(|d| {
+                let bs = d
+                    .backends
+                    .iter()
+                    .map(|b| format!("\"{b}\""))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{{\"codec\":\"{}\",\"backends\":[{}]}}", d.codec, bs)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{{\"encode\":{{\"codec\":\"av1\",\"backends\":[{}],\"max_bit_depth\":{},\"hdr\":{}}},\
+             \"decode\":{{\"backends\":[{}],\"codecs\":[{}]}},\"devices\":{}}}",
+            enc_b,
+            caps.max_bit_depth,
+            caps.hdr,
+            dec_b,
+            codecs,
+            devices_json(&devices)
+        );
+        return;
+    }
+
+    println!("rivet capabilities\n");
+    println!("Encode — AV1 (4:2:0):");
+    if enc.is_empty() {
+        println!("  (none) build with a `nvidia` / `amd` / `qsv` / `ffmpeg` feature");
+    } else {
+        println!("  backends   : {}", enc.join(", "));
+        println!("  max depth  : {}-bit", caps.max_bit_depth);
+        println!(
+            "  HDR        : {}",
+            if caps.hdr {
+                "yes (PQ / HLG, BT.2020, 10-bit)"
+            } else {
+                "no"
+            }
+        );
+    }
+
+    println!("\nDecode — codec → backends:");
+    if dec_backends.is_empty() {
+        println!("  (none) build with a `nvidia` / `amd` / `qsv` / `ffmpeg` feature");
+    } else {
+        for d in &dec {
+            let b = if d.backends.is_empty() {
+                "—".to_string()
+            } else {
+                d.backends.join(", ")
+            };
+            println!("  {:<8} {}", d.codec, b);
+        }
+    }
+
+    println!("\nDevices — {} detected:", devices.len());
+    if devices.is_empty() {
+        println!("  (none) CPU-only host — only the `ffmpeg` software path can run here");
+    } else {
+        for dv in &devices {
+            print!(
+                "  [{}] {} {}",
+                dv.index,
+                codec::gpu::manufacturer_label(dv.vendor),
+                dv.name
+            );
+            if dv.vram_mib > 0 {
+                print!(" ({} MiB)", dv.vram_mib);
+            }
+            println!();
+        }
+    }
 }

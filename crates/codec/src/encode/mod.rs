@@ -245,6 +245,24 @@ pub fn build_output_caps() -> OutputCaps {
     OutputCaps { max_bit_depth: 8, hdr: false }
 }
 
+/// AV1-encode backends compiled into this build, in dispatch-preference order.
+pub fn encode_backends() -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if cfg!(feature = "nvidia") {
+        v.push("nvenc");
+    }
+    if cfg!(feature = "amd") {
+        v.push("amf");
+    }
+    if cfg!(feature = "qsv") {
+        v.push("qsv");
+    }
+    if cfg!(feature = "ffmpeg") {
+        v.push("ffmpeg");
+    }
+    v
+}
+
 /// Construct the QSV encoder. The hand-rolled oneVPL encoder (`qsv.rs`) handles
 /// both 8-bit (NV12) and 10-bit (P010) AV1; under `not(qsv)` this hits the stub.
 fn make_qsv_encoder(config: EncoderConfig, gpu_index: u32) -> Result<Box<dyn Encoder>> {
