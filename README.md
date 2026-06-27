@@ -282,6 +282,17 @@ cargo build --release --features server,nvidia   # the API + an AV1 encoder
 rivet serve --addr 0.0.0.0:8080
 ```
 
+`POST /v1/transcode` takes either a **structured JSON body** — point at a
+server-side input/output **file path** (or inline base64), with a structured
+`spec` — or a **streamed binary body** with the spec in query params (so
+streaming the media is optional):
+
+```sh
+curl -X POST http://localhost:8080/v1/transcode -H 'Content-Type: application/json' \
+  -d '{"input":{"path":"/data/in.mkv"},"output":{"path":"/data/out.mp4"},
+       "spec":{"rungs":["1280x720"],"crf":28},"sync":true}'
+```
+
 Interactive docs ship with it: **`/swagger`** (Swagger UI), **`/redoc`** (Redoc),
 and the raw **`/openapi.json`** (OpenAPI 3.0); `/` links to all three.
 
