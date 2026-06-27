@@ -114,15 +114,20 @@ or your own implementation.
 
 > **Complete reference: [Configuring a transcode — the `OutputSpec`
 > guide](docs/output-spec.md)** documents every builder method, enum, and field
-> (rungs/quality, audio, color/bit-depth, GPU policy, chunk seams) with examples
-> and how to run a job. The sections below are a tour of the highlights.
+> (rungs/quality, audio, color/bit-depth, [video filters](docs/filters.md), GPU
+> policy, chunk seams) with examples and how to run a job. The sections below are
+> a tour of the highlights.
 
 ## Library usage
 
 ```toml
 [dependencies]
-rivet = { git = "https://github.com/elyerinfox/rivet" }
+# Published as `rivet-transcoder` (the crate name `rivet` was taken); the lib is
+# `rivet`, so the rename keeps `use rivet::…` working as below.
+rivet = { package = "rivet-transcoder", version = "0.1" }
 ```
+
+(Or `cargo add rivet-transcoder` and `use rivet_transcoder as rivet;`.)
 
 ### One file in, one file out
 
