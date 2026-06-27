@@ -118,7 +118,8 @@ Done once in the pump, before fanout, because it's identical for every rung:
   (`codec::tonemap` + `colorspace::convert_to_sdr_bt709`); `Passthrough`/`Hdr10`/
   `Hlg` keep it. The pump never tonemaps on its own — it's policy-driven.
 - **Video filters** — the spec's [filter chain](filters.md) (crop / pad / flip /
-  rotate / grayscale), applied last so every rung sees the transformed source.
+  rotate / grayscale / image overlay / colour), applied last so every rung sees
+  the transformed source. Overlay images are loaded once when the chain is prepared.
 
 ## 3. Per-rung scale → chunk
 

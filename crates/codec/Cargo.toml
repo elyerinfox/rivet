@@ -88,6 +88,9 @@ tracing.workspace = true
 bytes.workspace = true
 serde = { version = "1", features = ["derive"], optional = true }
 libloading.workspace = true
+# PNG decode for the `overlay` video filter (logo / watermark with alpha).
+# png-only so the dep stays small — no other image format is pulled in.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # mp4 crate is still needed by the container demuxer side; the codec
 # crate no longer pulls any CPU codec deps as of 2026-05-08.

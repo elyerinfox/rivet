@@ -135,6 +135,12 @@ pub async fn run_job(
         .map(|a| a.handling.clone())
         .unwrap_or_else(|| "none".to_string());
 
+    // Prepare the video filter chain once (loads any overlay images), then share
+    // the Arc with every decode pump / multi-GPU param built below.
+    let filter_chain = Arc::new(
+        codec::filter::FilterChain::prepare(&spec.filters).context("preparing video filters")?,
+    );
+
     let (rungs, hls_root, master_playlist) = match &spec.mode {
         OutputMode::SingleFile => {
             let rungs = run_single_file(
@@ -144,6 +150,7 @@ pub async fn run_job(
                 frame_rate,
                 frames_total,
                 prepared_audio.as_ref(),
+                Arc::clone(&filter_chain),
                 Arc::clone(&sink),
             )
             .await?;
@@ -157,6 +164,7 @@ pub async fn run_job(
                 &header,
                 frame_rate,
                 prepared_audio.as_ref(),
+                Arc::clone(&filter_chain),
                 output_dir,
                 Arc::clone(&sink),
             )
@@ -208,6 +216,7 @@ async fn run_single_file(
     frame_rate: f64,
     frames_total: Option<u64>,
     audio: Option<&PreparedAudio>,
+    filter_chain: Arc<codec::filter::FilterChain>,
     sink: Arc<dyn ProgressSink>,
 ) -> Result<Vec<RungOutput>> {
     // When the frame count is known and the host has more than one GPU, run the
@@ -239,6 +248,7 @@ async fn run_single_file(
             total_input_frames,
             audio,
             gpu_pool,
+            filter_chain,
             sink,
         )
         .await;
@@ -267,7 +277,7 @@ async fn run_single_file(
         needs_downsample: needs_chroma_downsample(header.info.pixel_format),
         tonemap_to_sdr: spec.tonemaps(),
         gpu_index: decode_gpu,
-        filters: std::sync::Arc::new(spec.filters.clone()),
+        filters: Arc::clone(&filter_chain),
     };
     let rt = tokio::runtime::Handle::current();
 
@@ -329,6 +339,7 @@ async fn run_single_file_multigpu(
     total_input_frames: u64,
     audio: Option<&PreparedAudio>,
     gpu_pool: Arc<crate::gpu_pool::GpuPool>,
+    filter_chain: Arc<codec::filter::FilterChain>,
     sink: Arc<dyn ProgressSink>,
 ) -> Result<Vec<RungOutput>> {
     const CHUNK_SECONDS: f64 = 2.0;
@@ -349,7 +360,7 @@ async fn run_single_file_multigpu(
         output_color_metadata,
         output_pixel_format,
         needs_downsample: needs_chroma_downsample(header.info.pixel_format),
-        filters: std::sync::Arc::new(spec.filters.clone()),
+        filters: Arc::clone(&filter_chain),
         frame_rate,
         gpu_pool,
         gpu_indices: multigpu::policy_gpu_indices(spec.encode_policy),
@@ -491,6 +502,7 @@ async fn run_hls(
     header: &DemuxHeader,
     frame_rate: f64,
     audio: Option<&PreparedAudio>,
+    filter_chain: Arc<codec::filter::FilterChain>,
     output_dir: Option<&Path>,
     sink: Arc<dyn ProgressSink>,
 ) -> Result<(Vec<RungOutput>, Option<PathBuf>, Option<PathBuf>)> {
@@ -526,7 +538,7 @@ async fn run_hls(
         output_color_metadata,
         output_pixel_format,
         needs_downsample: needs_chroma_downsample(header.info.pixel_format),
-        filters: std::sync::Arc::new(spec.filters.clone()),
+        filters: Arc::clone(&filter_chain),
         frame_rate,
         gpu_pool,
         gpu_indices: multigpu::policy_gpu_indices(spec.encode_policy),

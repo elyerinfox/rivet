@@ -84,8 +84,9 @@ pub struct MultiGpuParams<'a> {
     pub output_color_metadata: ColorMetadata,
     pub output_pixel_format: PixelFormat,
     pub needs_downsample: bool,
-    /// Per-frame video filter chain applied in the decode pump (before scaling).
-    pub filters: Arc<Vec<codec::filter::VideoFilter>>,
+    /// Prepared per-frame video filter chain applied in the decode pump (before
+    /// scaling). Overlay images are loaded once at prepare time.
+    pub filters: Arc<codec::filter::FilterChain>,
     pub frame_rate: f64,
     pub gpu_pool: Arc<GpuPool>,
     /// GPU indices the encode policy selected, in detection order. The decode

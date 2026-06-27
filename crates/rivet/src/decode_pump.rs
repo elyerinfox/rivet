@@ -38,10 +38,11 @@ pub struct DecodePumpConfig {
     pub tonemap_to_sdr: bool,
     /// Pin the decoder to this physical GPU; `None` = first matching adapter.
     pub gpu_index: Option<u32>,
-    /// Per-frame video filter chain (crop/pad/flip/rotate/grayscale), applied
-    /// after colorspace normalize and before the frame is fanned out to the
-    /// per-rung scalers. `Arc` so the per-GPU pump configs clone it cheaply.
-    pub filters: std::sync::Arc<Vec<codec::filter::VideoFilter>>,
+    /// Prepared per-frame video filter chain (crop/pad/flip/rotate/grayscale/
+    /// overlay/colour), applied after colorspace normalize and before the frame
+    /// is fanned out to the per-rung scalers. Overlay images are loaded once at
+    /// prepare time. `Arc` so the per-GPU pump configs clone it cheaply.
+    pub filters: std::sync::Arc<codec::filter::FilterChain>,
 }
 
 /// Blocking decode loop, designed for `tokio::task::spawn_blocking`. Fans
@@ -136,13 +137,12 @@ fn normalize_frame(cfg: &DecodePumpConfig, frame: VideoFrame) -> Result<VideoFra
         colorspace::convert_to_sdr_bt709(&downsampled, &cfg.source_color_metadata)
             .context("shared decode pump colorspace convert (HDR-aware)")?
     };
-    // Video filters (crop/pad/flip/rotate/grayscale) run on the normalized
-    // 4:2:0 frame, before the per-rung scalers see it.
+    // Video filters (crop/pad/flip/rotate/grayscale/overlay/colour) run on the
+    // normalized 4:2:0 frame, before the per-rung scalers see it.
     if cfg.filters.is_empty() {
         Ok(normalized)
     } else {
-        codec::filter::apply_chain(normalized, &cfg.filters)
-            .context("shared decode pump video filters")
+        cfg.filters.apply(normalized).context("shared decode pump video filters")
     }
 }
 

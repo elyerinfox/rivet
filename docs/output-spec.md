@@ -179,17 +179,19 @@ spec.with_max_frame_rate(30.0)   // never exceed 30 fps
 
 ## 6. Video filters — `with_filters(...)`
 
-Per-frame geometric/colour transforms (crop, pad, flip, rotate, grayscale)
-applied to the decoded source **once**, before per-rung scaling, so a filter
-applies to every rendition. `spec.filters` is a list of `codec::filter::VideoFilter`:
+Per-frame transforms — geometry (crop, pad, flip, rotate, grayscale), an image
+**overlay** (PNG logo/watermark with alpha), and colour (invert, brightness,
+contrast, saturation) — applied to the decoded source **once**, before per-rung
+scaling, so a filter applies to every rendition. `spec.filters` is a list of
+`codec::filter::VideoFilter`:
 
 ```rust
 spec.with_filters(vec![
     VideoFilter::Crop { w: 1920, h: 1080, x: None, y: None },
-    VideoFilter::HFlip,
+    VideoFilter::Overlay { image: "logo.png".into(), x: 24, y: 24 },
 ]);
 // or parse the equivalent ffmpeg-style string form:
-spec.with_filters(codec::filter::parse_chain("crop=1920:1080,hflip")?);
+spec.with_filters(codec::filter::parse_chain("crop=1920:1080,overlay=logo.png:24:24")?);
 ```
 
 See **[Video filters](filters.md)** for the full filter set, the string +

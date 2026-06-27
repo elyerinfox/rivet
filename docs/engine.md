@@ -248,7 +248,8 @@ demuxes + decodes the source one time and fans every normalized frame out to a
 4:4:4 → 4:2:0 downsample (when `needs_downsample`), then — *only when the spec's
 color policy says so* (`tonemap_to_sdr`) — an HDR-aware colorspace convert
 (`convert_to_sdr_bt709`, PQ/HLG → SDR BT.709), then the spec's
-[video filters](filters.md) (`codec::filter::apply_chain`). The pump never
+[video filters](filters.md) — a `codec::filter::FilterChain` prepared once in
+`run_job` (loading any overlay images) and applied per frame. The pump never
 decides to tonemap on its own; the caller sets the flag from the `OutputSpec`'s
 `ColorPolicy`.
 
