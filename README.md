@@ -150,28 +150,35 @@ A fully-specified single-file job, picking the codec quality, frame-rate cap,
 color/tonemap policy, and output bit depth per [the table below](#output-color--bit-depth):
 
 ```rust
-use rivet::{OutputSpec, Rung, Quality, AudioPolicy, ColorPolicy, PixelDepth, PerceptualTarget};
+use rivet::{OutputSpec, Rung, Quality, AudioPolicy, PerceptualTarget};
 
 let spec = OutputSpec::single_file(vec![
     Rung::new(1920, 1080).with_quality(Quality::crf(28)),
     Rung::new(1280, 720).with_quality(Quality::target(PerceptualTarget::Standard)),
 ])
 .with_audio(AudioPolicy::Auto)
-.with_max_frame_rate(30.0)                  // cap output cadence at 30 fps
-.with_color(ColorPolicy::TonemapToSdr)      // tonemap HDR sources → SDR BT.709 (default)
-.with_pixel_format(PixelDepth::Eight);      // 8-bit 4:2:0 — universal web compatibility
+.with_max_frame_rate(30.0)   // cap output cadence at 30 fps
+.web_sdr();                  // BT.709 8-bit SDR, tonemapping any HDR source down (default)
 
-spec.validate()?; // rejects e.g. HDR without 10-bit, or 10-bit on an 8-bit-only build
+spec.validate()?; // rejects e.g. an HDR request on a build with no 10-bit encoder
 ```
 
-To keep HDR instead of tonemapping (needs a 10-bit AV1 encoder — hardware NVENC
-`nvidia` / AMF `amd`, or software `ffmpeg`):
+The `.web_sdr()` line is a **color preset** — one call that sets the gamut +
+transfer + bit depth together. To keep HDR instead of tonemapping (needs a 10-bit
+AV1 encoder — `nvidia`, `amd`, `qsv`, or `ffmpeg`):
 
 ```rust
-let spec = OutputSpec::single_file(rungs)
-    .with_color(ColorPolicy::Hdr10)         // BT.2020 + PQ, no tonemap
-    .with_pixel_format(PixelDepth::Ten);    // 10-bit
+let spec = OutputSpec::single_file(rungs).hdr10();   // BT.2020 + PQ, 10-bit — one call
+// also: .hlg() · .passthrough() · or the low-level .with_color(..).with_bit_depth(..)
 ```
+
+> **Jargon, briefly.** *Gamut* = which colors are representable: **BT.709** is
+> the standard HD/SDR gamut (what most video uses), **BT.2020** is the wider one
+> HDR uses. *Transfer* = the SDR-vs-HDR brightness curve: **PQ** (HDR10) and
+> **HLG** (broadcast HDR). *Bit depth* is separate and the on-disk pixel format
+> follows from it — **8-bit → `yuv420p`**, **10-bit → `yuv420p10le`** (always
+> 4:2:0). HDR presets imply 10-bit, so you never set both. See
+> [Output color & bit depth](#output-color--bit-depth).
 
 ### Choosing GPUs
 
@@ -396,10 +403,12 @@ hand-rolled `dlopen` FFI in-tree (NVENC `YUV420_10BIT`, AMF `P010`, QSV oneVPL
 
 ### Output color & bit depth
 
-`OutputSpec::with_color(ColorPolicy)` + `with_pixel_format(PixelDepth)` choose
-the output color and bit depth; the decode pump tonemaps **only** when the
-policy says so (it never decides on its own). `validate()` rejects any
-combination this build can't actually produce:
+Two orthogonal axes: **color** (`with_color(ColorPolicy)` — gamut + SDR/HDR
+transfer) and **bit depth** (`with_bit_depth(BitDepth)` — bits per sample). Most
+callers don't touch them directly — the **presets** bundle both:
+`.web_sdr()` (default), `.hdr10()`, `.hlg()`, `.passthrough()`. The decode pump
+tonemaps **only** when the policy says so (it never decides on its own).
+`validate()` rejects any combination this build can't actually produce:
 
 | `ColorPolicy`  | Tonemap | Output signaling          | Bit depth | Needs |
 |----------------|:-------:|---------------------------|:---------:|-------|
@@ -408,16 +417,18 @@ combination this build can't actually produce:
 | `Hdr10`        | no      | BT.2020 + PQ (ST 2084)    | 10-bit    | a 10-bit encoder (below) |
 | `Hlg`          | no      | BT.2020 + ARIB STD-B67    | 10-bit    | a 10-bit encoder (below) |
 
-`PixelDepth` is `Auto` (follow the policy), `Eight`, or `Ten`. 10-bit / HDR
-output works on **hardware** — `nvidia`, `amd`, or `qsv` — **no `ffmpeg`
-needed** — or in software with `ffmpeg` (per the per-vendor tables above). The
-10-bit output is web-safe AV1 **Main** profile (4:2:0), HDR-tagged in the
-container via the `colr`/`mdcv`/`clli` atoms, which browsers decode and tonemap.
-On a build with no 10-bit encoder, `validate()` returns a clear error; the
-capability is queryable at runtime via `codec::encode::build_output_caps()`.
+`BitDepth` is `Auto` (follow the color policy — the usual choice), `EightBit`
+(`yuv420p`), or `TenBit` (`yuv420p10le`). 10-bit / HDR output works on
+**hardware** — `nvidia`, `amd`, or `qsv` — **no `ffmpeg` needed** — or in
+software with `ffmpeg` (per the per-vendor tables above). The 10-bit output is
+web-safe AV1 **Main** profile (4:2:0), HDR-tagged in the container via the
+`colr`/`mdcv`/`clli` atoms, which browsers decode and tonemap. On a build with
+no 10-bit encoder, `validate()` returns a clear error; the capability is
+queryable at runtime via `codec::encode::build_output_caps()`.
 
-For **web compatibility** keep the defaults — `TonemapToSdr` + `Auto` yields
-8-bit SDR BT.709 AV1, which every browser and device that supports AV1 plays.
+For **web compatibility** keep the default — `.web_sdr()` (i.e. `TonemapToSdr` +
+`Auto`) yields 8-bit SDR BT.709 AV1, which every browser and device that
+supports AV1 plays.
 
 ### Containers
 
