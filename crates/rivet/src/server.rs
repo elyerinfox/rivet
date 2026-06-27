@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use crate::progress::{ProgressSink, RungProgress, RungStatus};
 use crate::spec::{
-    AudioPolicy, ChunkSeamMode, ColorPolicy, OutputSpec, PixelDepth, Quality, Rung,
+    AudioPolicy, ChunkSeamMode, ColorPolicy, OutputSpec, BitDepth, Quality, Rung,
 };
 
 /// 4 GiB upload ceiling — large enough for long source files.
@@ -289,10 +289,10 @@ fn build_spec(params: &TranscodeParams, src_w: u32, src_h: u32) -> Result<Output
         };
     }
     if let Some(p) = &params.pixel_format {
-        spec.pixel_format = match p.as_str() {
-            "auto" => PixelDepth::Auto,
-            "8bit" => PixelDepth::Eight,
-            "10bit" => PixelDepth::Ten,
+        spec.bit_depth = match p.as_str() {
+            "auto" => BitDepth::Auto,
+            "8bit" => BitDepth::EightBit,
+            "10bit" => BitDepth::TenBit,
             o => anyhow::bail!("unknown pixel_format '{o}'"),
         };
     }
@@ -861,11 +861,11 @@ mod tests {
         let mut spec = OutputSpec::single_file(rungs);
         spec.audio = AudioPolicy::Drop;
         spec.color = ColorPolicy::Passthrough;
-        spec.pixel_format = PixelDepth::Ten;
+        spec.bit_depth = BitDepth::TenBit;
         spec = spec.with_gpu_index(1);
         let _ = &p;
         assert_eq!(spec.color, ColorPolicy::Passthrough);
-        assert_eq!(spec.pixel_format, PixelDepth::Ten);
+        assert_eq!(spec.bit_depth, BitDepth::TenBit);
         assert_eq!(spec.audio, AudioPolicy::Drop);
         assert_eq!(spec.gpu_index, Some(1));
     }

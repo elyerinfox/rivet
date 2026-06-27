@@ -210,7 +210,7 @@ pub struct EncoderWorkerConfig {
     pub gpu_vendor: Option<codec::gpu::GpuVendor>,
     /// Resolved **output** color metadata + pixel format (the encoder's input
     /// format and bitstream signaling). The engine computes these from the
-    /// `OutputSpec`'s `ColorPolicy` / `PixelDepth` via `resolve_output`, so the
+    /// `OutputSpec`'s `ColorPolicy` / `BitDepth` via `resolve_output`, so the
     /// worker no longer folds HDR→SDR itself — it just encodes to this format.
     pub output_color_metadata: ColorMetadata,
     pub output_pixel_format: PixelFormat,

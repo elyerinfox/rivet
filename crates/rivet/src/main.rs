@@ -31,7 +31,7 @@ use tracing_subscriber::EnvFilter;
 
 use rivet::progress::{RungProgress, RungStatus};
 use rivet::spec::{
-    AudioPolicy, ChunkSeamMode, ColorPolicy, EncodePolicy, GpuFamily, OutputSpec, PixelDepth,
+    AudioPolicy, BitDepth, ChunkSeamMode, ColorPolicy, EncodePolicy, GpuFamily, OutputSpec,
     Quality, Rung,
 };
 use rivet::{JobOutput, RungArtifact};
@@ -116,12 +116,12 @@ enum PixelArg {
     Ten,
 }
 
-impl From<PixelArg> for PixelDepth {
+impl From<PixelArg> for BitDepth {
     fn from(a: PixelArg) -> Self {
         match a {
-            PixelArg::Auto => PixelDepth::Auto,
-            PixelArg::Eight => PixelDepth::Eight,
-            PixelArg::Ten => PixelDepth::Ten,
+            PixelArg::Auto => BitDepth::Auto,
+            PixelArg::Eight => BitDepth::EightBit,
+            PixelArg::Ten => BitDepth::TenBit,
         }
     }
 }
@@ -376,7 +376,7 @@ fn transcode_cmd(args: TranscodeArgs) -> Result<()> {
     spec = spec.decode_gpu(args.decode_gpu);
     spec = spec
         .with_color(args.color.into())
-        .with_pixel_format(args.pixel_format.into())
+        .with_bit_depth(args.pixel_format.into())
         .chunk_seam_mode(args.seam_mode.into());
 
     // Progress: one carriage-return line per rung update.
