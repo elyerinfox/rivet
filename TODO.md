@@ -1,6 +1,27 @@
 # rivet — TODO / hardware-verification backlog
 
-## AMD (AMF) + Intel (QSV) hardware **decode** — verify on real silicon
+## ✅ Intel QSV — HARDWARE-VERIFIED on 3× Arc (2026-06-27)
+
+Full pipeline works end-to-end on an A310/A380/A750 box (Ubuntu 26.04, iHD
+26.1.2): QSV **decode** (H.264/HEVC, oneVPL 2.x internal-alloc + FrameInterface
+Map) → QSV **AV1 encode** → **multi-GPU** chunk-and-stitch across all 3 cards →
+**HLS ABR ladder** (5 rungs, valid `av01.0.00M.08` master). Fixes were extensive
+(struct layouts offsetof-verified, MFXLoad dispatcher, advisory Query, LowPower=ON,
+2 MiB→frame-sized bitstream buffer, crop-vs-coded dims, neutral-black NV12 padding
+for the green-bars/16-multiple issue). The mfx layouts are single-sourced in
+`crate::qsv_ffi`. **Remaining QSV polish**: 10-bit P010 path (CodingOption3 field
+offsets not yet offset-verified); confirm output pixel quality / no green bars on
+a non-16-multiple rung (e.g. 572-wide) by eye; the unused decode work-surface pool
++ `free_surface` are now dead and can be deleted.
+
+## AMD (AMF) hardware decode + encode — verify on RDNA-class silicon
+
+Status: **implemented as hand-rolled FFI, verified-by-review only** (no AMD card
+on either box). Our own FFI mirror of the AMD AMF SDK headers (no shiguredo).
+NB: AMF likely needs the same class of fixes QSV did — expect struct-layout and
+init-flow surprises on first real hardware.
+
+## Intel QSV hardware **decode** — (now verified above; historical notes)
 
 Status: **implemented as hand-rolled FFI, verified-by-review only.** Neither was
 testable on the dev box (RTX 3090 + Ryzen iGPU — no AMD RDNA3+ discrete, no Intel
