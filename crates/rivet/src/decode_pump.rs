@@ -38,6 +38,10 @@ pub struct DecodePumpConfig {
     pub tonemap_to_sdr: bool,
     /// Pin the decoder to this physical GPU; `None` = first matching adapter.
     pub gpu_index: Option<u32>,
+    /// Per-frame video filter chain (crop/pad/flip/rotate/grayscale), applied
+    /// after colorspace normalize and before the frame is fanned out to the
+    /// per-rung scalers. `Arc` so the per-GPU pump configs clone it cheaply.
+    pub filters: std::sync::Arc<Vec<codec::filter::VideoFilter>>,
 }
 
 /// Blocking decode loop, designed for `tokio::task::spawn_blocking`. Fans
@@ -125,13 +129,21 @@ fn normalize_frame(cfg: &DecodePumpConfig, frame: VideoFrame) -> Result<VideoFra
     } else {
         frame
     };
-    if !cfg.tonemap_to_sdr {
+    let normalized = if !cfg.tonemap_to_sdr {
         // Passthrough / HDR output: preserve the source color + bit depth.
-        return Ok(downsampled);
+        downsampled
+    } else {
+        colorspace::convert_to_sdr_bt709(&downsampled, &cfg.source_color_metadata)
+            .context("shared decode pump colorspace convert (HDR-aware)")?
+    };
+    // Video filters (crop/pad/flip/rotate/grayscale) run on the normalized
+    // 4:2:0 frame, before the per-rung scalers see it.
+    if cfg.filters.is_empty() {
+        Ok(normalized)
+    } else {
+        codec::filter::apply_chain(normalized, &cfg.filters)
+            .context("shared decode pump video filters")
     }
-    let normalized = colorspace::convert_to_sdr_bt709(&downsampled, &cfg.source_color_metadata)
-        .context("shared decode pump colorspace convert (HDR-aware)")?;
-    Ok(normalized)
 }
 
 /// Fan one frame out to every sender. Cloning `VideoFrame` is cheap (inner

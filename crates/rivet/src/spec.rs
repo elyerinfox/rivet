@@ -223,6 +223,9 @@ pub struct OutputSpec {
     /// How the multi-GPU **single-file** path keeps quality consistent across
     /// the chunk seams it stitches. See [`ChunkSeamMode`].
     pub chunk_seam_mode: ChunkSeamMode,
+    /// Video filters applied per-frame **before** per-rung scaling (crop, pad,
+    /// flip, rotate, grayscale). Empty = none. See [`codec::filter`].
+    pub filters: Vec<codec::filter::VideoFilter>,
 }
 
 /// Selects how a job's encode work is distributed across the host's GPUs.
@@ -372,6 +375,7 @@ impl Default for OutputSpec {
             color: ColorPolicy::default(),
             bit_depth: BitDepth::default(),
             chunk_seam_mode: ChunkSeamMode::default(),
+            filters: Vec::new(),
         }
     }
 }
@@ -496,6 +500,13 @@ impl OutputSpec {
     /// (`Parallel` fastest / `ParallelConstQp` seam-flat / `Serial` seam-free).
     pub fn chunk_seam_mode(mut self, mode: ChunkSeamMode) -> Self {
         self.chunk_seam_mode = mode;
+        self
+    }
+
+    /// Set the per-frame video filter chain (crop / pad / flip / rotate /
+    /// grayscale), applied before per-rung scaling. See [`codec::filter`].
+    pub fn with_filters(mut self, filters: Vec<codec::filter::VideoFilter>) -> Self {
+        self.filters = filters;
         self
     }
 

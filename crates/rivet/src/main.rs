@@ -221,6 +221,10 @@ enum Command {
         /// `serial` (one encoder, seam-free, no multi-GPU single-file speedup).
         #[arg(long = "seam-mode", value_enum, default_value = "parallel")]
         seam_mode: SeamArg,
+        /// Video filter chain (ffmpeg-`-vf`-style), applied before scaling, e.g.
+        /// `crop=1280:720,hflip` or `pad=1920:1080` / `rotate=90` / `grayscale`.
+        #[arg(long)]
+        filter: Option<String>,
     },
     /// Inspect an input file without transcoding it.
     Probe {
@@ -276,6 +280,9 @@ enum Command {
         /// Pin encode to this GPU index.
         #[arg(long)]
         gpu: Option<u32>,
+        /// Video filter chain (e.g. `crop=1280:720,hflip`).
+        #[arg(long)]
+        filter: Option<String>,
     },
     /// Run a **Unix-domain-socket** IPC server (needs the `ipc` feature; Unix
     /// only at runtime). Each connection: the client writes media, half-closes
@@ -348,6 +355,7 @@ fn run() -> Result<()> {
             color,
             pixel_format,
             seam_mode,
+            filter,
         } => transcode_cmd(TranscodeArgs {
             input,
             output,
@@ -367,6 +375,7 @@ fn run() -> Result<()> {
             color,
             pixel_format,
             seam_mode,
+            filter,
         }),
         Command::Probe { input, json } => {
             let info = rivet::probe_file(&input)
@@ -396,6 +405,7 @@ fn run() -> Result<()> {
             width,
             height,
             gpu,
+            filter,
         } => pipe_cmd(TranscodeSettings {
             crf,
             speed,
@@ -406,6 +416,7 @@ fn run() -> Result<()> {
             width,
             height,
             gpu,
+            filter,
             ..Default::default()
         }),
         #[cfg(feature = "ipc")]
@@ -448,6 +459,7 @@ struct TranscodeArgs {
     color: ColorArg,
     pixel_format: PixelArg,
     seam_mode: SeamArg,
+    filter: Option<String>,
 }
 
 fn transcode_cmd(args: TranscodeArgs) -> Result<()> {
@@ -486,6 +498,7 @@ fn transcode_cmd(args: TranscodeArgs) -> Result<()> {
         decode_gpu: args.decode_gpu,
         width: None,
         height: None,
+        filter: args.filter.clone(),
     };
     let spec = settings
         .into_spec(probed.width, probed.height)

@@ -84,6 +84,8 @@ pub struct MultiGpuParams<'a> {
     pub output_color_metadata: ColorMetadata,
     pub output_pixel_format: PixelFormat,
     pub needs_downsample: bool,
+    /// Per-frame video filter chain applied in the decode pump (before scaling).
+    pub filters: Arc<Vec<codec::filter::VideoFilter>>,
     pub frame_rate: f64,
     pub gpu_pool: Arc<GpuPool>,
     /// GPU indices the encode policy selected, in detection order. The decode
@@ -307,6 +309,7 @@ pub async fn run_multigpu_hls(
         needs_downsample: params.needs_downsample,
         tonemap_to_sdr: params.tonemap_to_sdr,
         gpu_index,
+        filters: params.filters.clone(),
     };
     if use_shared_pump {
         let cfg = make_pump_cfg(params.decode_gpu_for(0));
@@ -929,6 +932,7 @@ pub async fn run_multigpu_single_file(
         needs_downsample: params.needs_downsample,
         tonemap_to_sdr: params.tonemap_to_sdr,
         gpu_index,
+        filters: params.filters.clone(),
     };
     if use_shared_pump {
         let cfg = make_pump_cfg(params.decode_gpu_for(0));

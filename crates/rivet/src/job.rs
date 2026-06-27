@@ -267,6 +267,7 @@ async fn run_single_file(
         needs_downsample: needs_chroma_downsample(header.info.pixel_format),
         tonemap_to_sdr: spec.tonemaps(),
         gpu_index: decode_gpu,
+        filters: std::sync::Arc::new(spec.filters.clone()),
     };
     let rt = tokio::runtime::Handle::current();
 
@@ -348,6 +349,7 @@ async fn run_single_file_multigpu(
         output_color_metadata,
         output_pixel_format,
         needs_downsample: needs_chroma_downsample(header.info.pixel_format),
+        filters: std::sync::Arc::new(spec.filters.clone()),
         frame_rate,
         gpu_pool,
         gpu_indices: multigpu::policy_gpu_indices(spec.encode_policy),
@@ -524,6 +526,7 @@ async fn run_hls(
         output_color_metadata,
         output_pixel_format,
         needs_downsample: needs_chroma_downsample(header.info.pixel_format),
+        filters: std::sync::Arc::new(spec.filters.clone()),
         frame_rate,
         gpu_pool,
         gpu_indices: multigpu::policy_gpu_indices(spec.encode_policy),

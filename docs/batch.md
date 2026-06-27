@@ -100,6 +100,7 @@ like `crff: 24` fails loudly instead of being silently ignored.
 | `single_gpu` | bool | Use one GPU (serial). |
 | `decode_gpu` | int | Pin the decode pump to a GPU. |
 | `width`, `height` | int | Scale a single-rung output (ignored when `rungs`/`ladder` is set). |
+| `filter` | string | Video filter chain, e.g. `crop=1280:720,hflip` — see [output-spec § Video filters](output-spec.md#video-filters--with_filters). |
 
 These are exactly the knobs in the [`OutputSpec` guide](output-spec.md) — read it
 for what each one does and the valid combinations. `validate()` still runs per

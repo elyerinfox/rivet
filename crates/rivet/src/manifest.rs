@@ -77,6 +77,8 @@ pub struct JobSpec {
     pub decode_gpu: Option<u32>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Video filter chain, e.g. `crop=1280:720,hflip` (applied before scaling).
+    pub filter: Option<String>,
 }
 
 impl JobSpec {
@@ -109,6 +111,7 @@ impl JobSpec {
             decode_gpu: pick!(decode_gpu),
             width: pick!(width),
             height: pick!(height),
+            filter: pick!(filter),
         }
     }
 
@@ -150,6 +153,7 @@ impl JobSpec {
         s.decode_gpu = self.decode_gpu;
         s.width = self.width;
         s.height = self.height;
+        s.filter = self.filter.clone();
         Ok(s)
     }
 }

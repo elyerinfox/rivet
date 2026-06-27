@@ -236,6 +236,8 @@ struct TranscodeParams {
     seam: Option<String>,
     max_fps: Option<f64>,
     gpu: Option<u32>,
+    /// Video filter chain, e.g. `crop=1280:720,hflip`.
+    filter: Option<String>,
     /// Block until the job finishes and return the artifact directly.
     sync: Option<bool>,
 }
@@ -306,6 +308,8 @@ struct SpecBody {
     seam: Option<String>,
     max_fps: Option<f64>,
     gpu: Option<u32>,
+    /// Video filter chain, e.g. `crop=1280:720,hflip`.
+    filter: Option<String>,
 }
 
 impl SpecBody {
@@ -324,6 +328,7 @@ impl SpecBody {
             seam: self.seam,
             max_fps: self.max_fps,
             gpu: self.gpu,
+            filter: self.filter,
             sync: None,
         }
     }
@@ -455,6 +460,7 @@ impl TranscodeParams {
         }
         s.max_fps = self.max_fps;
         s.gpu = self.gpu;
+        s.filter = self.filter.clone();
         Ok(s)
     }
 }
@@ -885,6 +891,7 @@ pub fn openapi_spec() -> Value {
                         qp("seam", "string", "parallel (default) | constqp | serial"),
                         qp("max_fps", "number", "Cap the output frame rate."),
                         qp("gpu", "integer", "Pin encode/decode to this GPU index."),
+                        qp("filter", "string", "Video filter chain, e.g. crop=1280:720,hflip."),
                         qp("sync", "boolean", "Block and return the artifact directly.")
                     ],
                     "requestBody": { "required": true, "content": {
@@ -992,7 +999,8 @@ pub fn openapi_spec() -> Value {
                         "bit_depth": { "type": "string", "enum": ["auto", "8bit", "10bit"] },
                         "seam": { "type": "string", "enum": ["parallel", "constqp", "serial"] },
                         "max_fps": { "type": "number" },
-                        "gpu": { "type": "integer" }
+                        "gpu": { "type": "integer" },
+                        "filter": { "type": "string", "example": "crop=1280:720,hflip" }
                     }
                 },
                 "Health": { "type": "object", "properties": {

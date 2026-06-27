@@ -6,6 +6,7 @@ pub mod colorspace;
 pub(crate) mod cuda_lock;
 pub mod decode;
 pub mod encode;
+pub mod filter;
 pub mod frame;
 pub mod gpu;
 pub mod hevc_sei;

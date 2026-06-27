@@ -177,6 +177,45 @@ spec.with_max_frame_rate(30.0)   // never exceed 30 fps
 
 ---
 
+## Video filters — `with_filters(...)`
+
+Per-frame geometric/colour transforms applied to the decoded source **once**,
+before fan-out + per-rung scaling + encode (so a filter applies to every
+rendition). The wire form is an **ffmpeg-`-vf`-style chain string** —
+comma-separated, each `name` or `name=a:b:…` — available everywhere:
+
+| Surface | How |
+|---------|-----|
+| CLI `transcode` / `pipe` | `--filter "crop=1280:720,hflip"` |
+| Batch manifest | `filter: "crop=1280:720,hflip"` |
+| HTTP API | `?filter=…` (query) or `"filter": "…"` (JSON `spec`) |
+| IPC header | `#rivet filter=crop=1280:720,hflip …` |
+| Library | `spec.with_filters(codec::filter::parse_chain("…")?)` |
+
+The filters:
+
+| Filter | Form | Effect |
+|--------|------|--------|
+| crop | `crop=W:H` or `crop=W:H:X:Y` | Crop a `W×H` region (centred, or at `X,Y`). |
+| pad | `pad=W:H` or `pad=W:H:X:Y` | Letterbox/pillarbox into a `W×H` canvas (centred, black). |
+| hflip / vflip | `hflip` · `vflip` | Mirror horizontally / vertically. |
+| rotate | `rotate=90` \| `180` \| `270` (or `transpose`) | Rotate clockwise; 90/270 swap width↔height. |
+| grayscale | `grayscale` (or `gray`) | Drop chroma. |
+
+Filters run on the normalised 4:2:0 frame and work for both 8-bit and 10-bit;
+4:2:0 alignment means crop/pad sizes round to even. They change the *source*
+frame, then the per-rung scaler scales the filtered frame to the rung size — so
+if a crop changes the aspect ratio, set rung dimensions to match. Implementation:
+[`codec::filter`](../crates/codec/src/filter.rs).
+
+```rust
+// crop to 16:9, mirror, then the ladder scales the result
+let spec = OutputSpec::single_file(rungs)
+    .with_filters(codec::filter::parse_chain("crop=1920:1080,hflip")?);
+```
+
+---
+
 ## 6. GPU selection
 
 How encode work spreads across the host's GPUs.
