@@ -351,7 +351,8 @@ pub fn select_encoder(
                             gpu_name = %dev.name,
                             gpu_index = dev.index,
                             vendor = ?pinned,
-                            "using vendor-pinned AV1 hardware encoder (lease-driven dispatch)"
+                            codec = ?config.codec,
+                            "using vendor-pinned hardware encoder (lease-driven dispatch)"
                         );
                         Ok(enc)
                     }
@@ -363,7 +364,8 @@ pub fn select_encoder(
                         // the underlying driver error so the worker
                         // can report it on the failed-job event.
                         Err(anyhow::anyhow!(
-                            "vendor-pinned AV1 encoder init failed (vendor={pinned:?}, gpu={}, idx={}): {e}",
+                            "vendor-pinned {:?} encoder init failed (vendor={pinned:?}, gpu={}, idx={}): {e}",
+                            config.codec,
                             dev.name,
                             dev.index,
                         ))
@@ -371,8 +373,9 @@ pub fn select_encoder(
                 };
             }
             return Err(anyhow::anyhow!(
-                "vendor-pinned GPU lacks AV1 encode silicon (vendor={pinned:?}, gpu={}); \
+                "vendor-pinned GPU lacks {:?} encode silicon (vendor={pinned:?}, gpu={}); \
                  GPU-only encode policy has no CPU fallback",
+                config.codec,
                 dev.name,
             ));
         }
@@ -397,7 +400,8 @@ pub fn select_encoder(
                     tracing::info!(
                         gpu_name = %dev.name,
                         gpu_index = dev.index,
-                        "using NVENC AV1 hardware encoder"
+                        codec = ?config.codec,
+                        "using NVENC hardware encoder"
                     );
                     return Ok(Box::new(enc));
                 }
@@ -425,7 +429,8 @@ pub fn select_encoder(
                     tracing::info!(
                         gpu_name = %dev.name,
                         gpu_index = dev.index,
-                        "using AMF AV1 hardware encoder"
+                        codec = ?config.codec,
+                        "using AMF hardware encoder"
                     );
                     return Ok(Box::new(enc));
                 }
@@ -448,7 +453,8 @@ pub fn select_encoder(
                     tracing::info!(
                         gpu_name = %dev.name,
                         gpu_index = dev.index,
-                        "using QSV AV1 hardware encoder"
+                        codec = ?config.codec,
+                        "using QSV hardware encoder"
                     );
                     return Ok(enc);
                 }

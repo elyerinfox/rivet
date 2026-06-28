@@ -77,11 +77,31 @@ no B-frames) because the ring-of-4 sync drain emits one packet per
 frames or deadlock the EOS flush. When every frame is drained during encode, the
 EOS flush is skipped (sending it busy-waits on the SDK 13 driver).
 
+### Multi-GPU + capability dropout (all codecs)
+
+The cross-cutting engine features apply to H.264/H.265 too, not just AV1:
+- **Decode pump, video filters, and the multi-rung ABR ladder** were always
+  codec-agnostic (upstream of the encoder).
+- **Capability dropout** is codec-aware: `encode_capable(dev, codec)` (cached per
+  `(gpu_index, codec)`) probes the actual encoder, so `gpu_pool_for_policy` drops
+  GPUs that can't encode the *requested* codec — e.g. an NVIDIA Ampere card is
+  dropped from an AV1 pool but kept for an H.264/H.265 pool.
+- **Multi-GPU chunk-and-stitch** covers AV1, H.264, and H.265. The cross-vendor
+  codec invariant is an enum — `Av1Invariant` (sequence-header fields) +
+  `H26xInvariant` (profile / level / chroma / bit-depth / dims from the SPS, via
+  `parse_h264_sps` / `parse_hevc_sps`). Each chunk is a closed GOP (first frame an
+  IDR), so stitched H.264/H.265 reset references cleanly at chunk boundaries. HLS
+  output stays AV1-only (the CMAF codec-string path is AV1-specific).
+
 Validation:
 - **NVENC on RTX 3090** (this repo's dev box): H.264 + H.265 each decode 96/96
   frames, 0 errors, BT.709, ~0.9 s (full NVDEC→NVENC round-trip).
-- **QSV on the 3× Arc box**: H.264/H.265/AV1 each decode 96/96 frames, 0 errors,
-  identical PSNR-vs-source, consistent BT.709.
+- **QSV single-GPU on the Arc box**: H.264/H.265/AV1 each decode 96/96 frames, 0
+  errors, identical PSNR-vs-source, consistent BT.709.
+- **QSV multi-GPU on the 3× Arc box**: H.264 + H.265 chunk-and-stitch across all
+  three Arcs (A310/A380/A750), 5 segments dispatched over the lease pool, H26x
+  invariant captured + matched with 0 mismatches, stitched output decodes 300/300
+  frames, 0 errors, BT.709.
 
 ## The encode dispatch & capability query
 
