@@ -64,6 +64,26 @@ fn is_idr(nal: &[u8], codec: NalMuxCodec) -> bool {
     }
 }
 
+/// Whether this NAL is a VCL (slice) NAL.
+fn is_vcl(nal: &[u8], codec: NalMuxCodec) -> bool {
+    let t = nal_type(nal, codec);
+    match codec {
+        NalMuxCodec::H264 => (1..=5).contains(&t),
+        NalMuxCodec::H265 => t <= 31,
+    }
+}
+
+/// Whether a VCL slice begins a new picture — the access-unit boundary signal
+/// when the encoder emits no AUD. H.264: `first_mb_in_slice == 0` ⟺ the slice
+/// header's leading `ue(v)` is the single bit `1` (top bit set). H.265:
+/// `first_slice_segment_in_pic_flag` is the first bit after the 2-byte header.
+fn first_slice_in_pic(nal: &[u8], codec: NalMuxCodec) -> bool {
+    match codec {
+        NalMuxCodec::H264 => nal.len() > 1 && (nal[1] & 0x80) != 0,
+        NalMuxCodec::H265 => nal.len() > 2 && (nal[2] & 0x80) != 0,
+    }
+}
+
 /// One muxed access unit (frame): its length-prefixed sample bytes + whether
 /// it is a keyframe.
 #[derive(Debug, Clone)]
@@ -143,11 +163,20 @@ impl NalSampleWriter {
     /// delimited by the AUD NAL (a packet with no AUD is treated as one unit).
     /// SPS/PPS/VPS are captured (for the config box) and stripped from samples.
     pub fn push_packet(&mut self, annexb: &[u8]) -> Vec<AuSample> {
-        // Group NALs into access units: a new unit begins at each AUD.
+        // Group NALs into access units. A new unit begins at an AUD, or — when
+        // the encoder emits no AUD (QSV H.265) — at the first VCL slice of a new
+        // picture once the current unit already holds a slice.
         let mut units: Vec<Vec<&[u8]>> = vec![Vec::new()];
+        let mut cur_has_vcl = false;
         for nal in split_annexb_nals(annexb) {
-            if is_aud(nal, self.codec) && !units.last().unwrap().is_empty() {
+            let new_au = is_aud(nal, self.codec)
+                || (is_vcl(nal, self.codec) && cur_has_vcl && first_slice_in_pic(nal, self.codec));
+            if new_au && !units.last().unwrap().is_empty() {
                 units.push(Vec::new());
+                cur_has_vcl = false;
+            }
+            if is_vcl(nal, self.codec) {
+                cur_has_vcl = true;
             }
             units.last_mut().unwrap().push(nal);
         }
@@ -251,6 +280,20 @@ mod tests {
         assert_eq!(samples.len(), 2, "two AUDs → two samples");
         assert!(samples[0].is_keyframe, "AU1 has the IDR");
         assert!(!samples[1].is_keyframe, "AU2 is a P-frame");
+    }
+
+    #[test]
+    fn h265_splits_multi_picture_packet_without_aud() {
+        // QSV H.265 emits no AUD: split on VCL slices with first_slice flag set.
+        let idr = [0x26u8, 0x01, 0xA0]; // type 19 (IDR), first_slice_segment=1
+        let trail = [0x02u8, 0x01, 0xA0]; // type 1 (TRAIL_R), first_slice_segment=1
+        let mut frame = sc4(&idr);
+        frame.extend(sc4(&trail));
+        let mut w = NalSampleWriter::new(NalMuxCodec::H265);
+        let samples = w.push_packet(&frame);
+        assert_eq!(samples.len(), 2, "two first-slice VCL NALs → two access units");
+        assert!(samples[0].is_keyframe);
+        assert!(!samples[1].is_keyframe);
     }
 
     #[test]
