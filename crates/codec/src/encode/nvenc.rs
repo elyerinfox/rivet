@@ -89,6 +89,15 @@ const NV_ENC_TUNING_INFO_HIGH_QUALITY: c_uint = 1;
 // Rate control modes — vendor/nvidia/nvEncodeAPI.h:77-84 (_NV_ENC_PARAMS_RC_MODE).
 const NV_ENC_PARAMS_RC_CONSTQP: u32 = 0x0;
 const NV_ENC_PARAMS_RC_VBR: u32 = 0x1;
+
+// NV_ENC_RC_PARAMS bitfield bits (nvEncodeAPI.h). `enableLookahead` (bit 5) and
+// `zeroReorderDelay` (bit 9) control output buffering. Our ring-of-4 sync drain
+// is strictly 1-in-1-out (one packet per EncodePicture), so for H.264/H.265 we
+// CLEAR lookahead and SET zeroReorderDelay to force the encoder to emit each
+// frame's packet immediately — otherwise lookahead/reorder buffering strands
+// the tail frames (frame loss) or deadlocks the EOS drain (hang).
+const RC_FLAG_ENABLE_LOOKAHEAD: u32 = 1 << 5;
+const RC_FLAG_ZERO_REORDER_DELAY: u32 = 1 << 9;
 // `_HQ` is gone in SDK 12.2 (merged into VBR + high-quality tuning) but
 // kept in the enum for back-compat. We emit plain VBR with tuning =
 // HIGH_QUALITY which is the 12.2-idiomatic "VBR_HQ" path.
@@ -150,6 +159,60 @@ const NV_ENC_CODEC_AV1_GUID: Guid = Guid {
     data3: 0x4759,
     data4: [0x86, 0x2d, 0x5d, 0x15, 0xcd, 0x16, 0xd2, 0x54],
 };
+
+// NV_ENC_CODEC_H264_GUID (nvEncodeAPI.h). Supported by every NVENC since
+// Kepler — including the RTX 3090 (Ampere) which has no AV1 encode silicon.
+const NV_ENC_CODEC_H264_GUID: Guid = Guid {
+    data1: 0x6bc82762,
+    data2: 0x4e63,
+    data3: 0x4ca4,
+    data4: [0xaa, 0x85, 0x1e, 0x50, 0xf3, 0x21, 0xf6, 0xbf],
+};
+
+// NV_ENC_CODEC_HEVC_GUID (nvEncodeAPI.h). Supported since Maxwell 2nd-gen.
+const NV_ENC_CODEC_HEVC_GUID: Guid = Guid {
+    data1: 0x790cdc88,
+    data2: 0x4522,
+    data3: 0x4d7b,
+    data4: [0x94, 0x25, 0xbd, 0xa9, 0x97, 0x5f, 0x76, 0x03],
+};
+
+// NV_ENC_H264_PROFILE_HIGH_GUID — 4:2:0 8-bit High profile.
+const NV_ENC_H264_PROFILE_HIGH_GUID: Guid = Guid {
+    data1: 0xe7cbc309,
+    data2: 0x4f7a,
+    data3: 0x4b89,
+    data4: [0xaf, 0x2a, 0xd5, 0x37, 0xc9, 0x2b, 0xe3, 0x10],
+};
+
+// NV_ENC_HEVC_PROFILE_MAIN_GUID — 4:2:0 8-bit Main profile.
+const NV_ENC_HEVC_PROFILE_MAIN_GUID: Guid = Guid {
+    data1: 0xb514c39a,
+    data2: 0xb55b,
+    data3: 0x40fa,
+    data4: [0x87, 0x8f, 0xf1, 0x25, 0x3b, 0x4d, 0xfd, 0xec],
+};
+
+/// The NVENC codec GUID for our `VideoCodec`.
+fn nvenc_codec_guid(codec: crate::frame::VideoCodec) -> Guid {
+    use crate::frame::VideoCodec;
+    match codec {
+        VideoCodec::Av1 => NV_ENC_CODEC_AV1_GUID,
+        VideoCodec::H264 => NV_ENC_CODEC_H264_GUID,
+        VideoCodec::H265 => NV_ENC_CODEC_HEVC_GUID,
+    }
+}
+
+/// The default profile GUID for H.264 / H.265. AV1 uses the preset's default
+/// profile (a zero GUID lets the driver autoselect).
+fn nvenc_profile_guid(codec: crate::frame::VideoCodec) -> Guid {
+    use crate::frame::VideoCodec;
+    match codec {
+        VideoCodec::H264 => NV_ENC_H264_PROFILE_HIGH_GUID,
+        VideoCodec::H265 => NV_ENC_HEVC_PROFILE_MAIN_GUID,
+        VideoCodec::Av1 => Guid { data1: 0, data2: 0, data3: 0, data4: [0u8; 8] },
+    }
+}
 
 // `NV_ENC_CAPS_PARAM` (nvEncodeAPI.h) — query one capability at a time.
 // Layout: u32 version + NV_ENC_CAPS enum + reserved[62] = 256 bytes.
@@ -1112,17 +1175,13 @@ pub struct NvencEncoder {
 
 impl NvencEncoder {
     pub fn new(config: EncoderConfig, gpu_index: u32) -> Result<Self> {
-        // NVENC currently encodes AV1 only. H.264/H.265 output is validated on
-        // Intel QSV; native NVENC H.264/H.265 (the NV_ENC_CONFIG_H264/HEVC config
-        // union) is a hardware-verification follow-up. Reject rather than
-        // silently emit AV1 for a non-AV1 request.
-        if config.codec != crate::frame::VideoCodec::Av1 {
-            anyhow::bail!(
-                "NVENC encodes AV1 only today; for {:?} output use Intel QSV (Arc+) \
-                 — native NVENC H.264/H.265 is a follow-up",
-                config.codec
-            );
-        }
+        // The codec GUID drives capability validation, preset selection, and
+        // session init. AV1 (Ada+ / Ampere datacenter), H.264 (Kepler+), and
+        // H.265 (Maxwell+) all dispatch through the same path; codec-specific
+        // config is branched below. H.264/H.265 emit Annex-B (the muxer's
+        // nal_mux repackages); only the AV1 union is hand-overridden.
+        let codec_guid = nvenc_codec_guid(config.codec);
+        let is_av1 = config.codec == crate::frame::VideoCodec::Av1;
         // Take the SHARED CUDA-init lock BEFORE any FFI work. This
         // serializes encoder construction not just against other
         // encoders but ALSO against NVDEC streaming-decoder ctor —
@@ -1411,22 +1470,24 @@ impl NvencEncoder {
                         Some(format!("NvEncGetEncodeGUIDs failed on GPU {gpu_index}"))
                     } else if !guids[..returned as usize]
                         .iter()
-                        .any(|g| *g == NV_ENC_CODEC_AV1_GUID)
+                        .any(|g| *g == codec_guid)
                     {
                         Some(format!(
-                            "NVENC on GPU {gpu_index} does not support AV1 encode \
-                             ({returned} codec(s) advertised, none AV1) — needs NVIDIA \
-                             Ada+ or an Ampere datacenter SKU"
+                            "NVENC on GPU {gpu_index} does not support {:?} encode \
+                             ({returned} codec(s) advertised, none matched) — AV1 needs \
+                             NVIDIA Ada+ / an Ampere datacenter SKU; H.264 needs Kepler+; \
+                             H.265 needs Maxwell+",
+                            config.codec
                         ))
                     } else {
-                        // AV1 supported — validate resolution + 10-bit caps.
+                        // Codec supported — validate resolution + 10-bit caps for
+                        // the SELECTED codec's GUID.
                         let query = |cap: c_uint| -> i32 {
                             let mut p: NvEncCapsParam = std::mem::zeroed();
                             p.version = struct_version(1);
                             p.caps_to_query = cap;
                             let mut val: c_int = 0;
-                            let rc =
-                                fn_get_encode_caps(encoder, NV_ENC_CODEC_AV1_GUID, &mut p, &mut val);
+                            let rc = fn_get_encode_caps(encoder, codec_guid, &mut p, &mut val);
                             if rc != NV_ENC_SUCCESS { -1 } else { val }
                         };
                         let w_max = query(NV_ENC_CAPS_WIDTH_MAX);
@@ -1436,24 +1497,25 @@ impl NvencEncoder {
                             && ((config.width as i32) > w_max || (config.height as i32) > h_max)
                         {
                             Some(format!(
-                                "NVENC AV1 on GPU {gpu_index} maxes at {w_max}x{h_max}, \
+                                "NVENC {:?} on GPU {gpu_index} maxes at {w_max}x{h_max}, \
                                  requested {}x{}",
-                                config.width, config.height
+                                config.codec, config.width, config.height
                             ))
                         } else if config.pixel_format == PixelFormat::Yuv420p10le
                             && query(NV_ENC_CAPS_SUPPORT_10BIT_ENCODE) == 0
                         {
                             Some(format!(
-                                "NVENC on GPU {gpu_index} does not support 10-bit AV1 encode"
+                                "NVENC on GPU {gpu_index} does not support 10-bit {:?} encode",
+                                config.codec
                             ))
                         } else {
                             tracing::info!(
                                 gpu_index,
-                                av1 = true,
+                                codec = ?config.codec,
                                 w_max,
                                 h_max,
                                 ten_bit = config.pixel_format == PixelFormat::Yuv420p10le,
-                                "NVENC AV1 capability validated"
+                                "NVENC capability validated"
                             );
                             None
                         }
@@ -1525,7 +1587,7 @@ impl NvencEncoder {
             );
             let rc = fn_get_preset_config_ex(
                 encoder,
-                NV_ENC_CODEC_AV1_GUID,
+                codec_guid,
                 preset_guid,
                 tp.tuning_info,
                 &mut padded.base,
@@ -1649,30 +1711,57 @@ impl NvencEncoder {
             let bit_depth_minus8 = pixel_bit_depth_minus8_for(config.pixel_format);
             let bit_depth_enum = if bit_depth_minus8 == 0 { 0 } else { 1 };
 
-            // outputAnnexBFormat = 0 (LOB), repeatSeqHdr = 1, chroma = 4:2:0.
-            // enable_timing_info stays 0 (we don't emit it).
-            enc_config.codec_config_av1.flags = AV1_BIT_REPEAT_SEQ_HDR | AV1_CHROMA_FORMAT_IDC_420;
-            enc_config.codec_config_av1.idr_period = config.keyframe_interval;
-            enc_config.codec_config_av1.max_num_ref_frames_in_dpb = 4;
-            enc_config.codec_config_av1.num_tile_columns = tp.num_tile_columns;
-            enc_config.codec_config_av1.num_tile_rows = tp.num_tile_rows;
-            enc_config.codec_config_av1.output_bit_depth = bit_depth_enum;
-            enc_config.codec_config_av1.input_bit_depth = bit_depth_enum;
+            if is_av1 {
+                // ─── AV1 codec-specific config (SDK 13 union view) ───────
+                // outputAnnexBFormat = 0 (LOB), repeatSeqHdr = 1, chroma 4:2:0.
+                enc_config.codec_config_av1.flags =
+                    AV1_BIT_REPEAT_SEQ_HDR | AV1_CHROMA_FORMAT_IDC_420;
+                enc_config.codec_config_av1.idr_period = config.keyframe_interval;
+                enc_config.codec_config_av1.max_num_ref_frames_in_dpb = 4;
+                enc_config.codec_config_av1.num_tile_columns = tp.num_tile_columns;
+                enc_config.codec_config_av1.num_tile_rows = tp.num_tile_rows;
+                enc_config.codec_config_av1.output_bit_depth = bit_depth_enum;
+                enc_config.codec_config_av1.input_bit_depth = bit_depth_enum;
 
-            // Color signalling — wire ColorMetadata into the OBU seq
-            // header. SDK 13 dropped the explicit
-            // `color_description_present_flag` field; the codes are
-            // emitted whenever any of them is non-zero (driver-side
-            // policy per SDK 13 docs).
-            let cm = &config.color_metadata;
-            enc_config.codec_config_av1.color_primaries = cm.colour_primaries as u32;
-            enc_config.codec_config_av1.transfer_characteristics = transfer_to_h273(cm.transfer);
-            enc_config.codec_config_av1.matrix_coefficients = cm.matrix_coefficients as u32;
-            enc_config.codec_config_av1.color_range = cm.full_range as u32;
+                // Color signalling — wire ColorMetadata into the OBU seq header.
+                let cm = &config.color_metadata;
+                enc_config.codec_config_av1.color_primaries = cm.colour_primaries as u32;
+                enc_config.codec_config_av1.transfer_characteristics =
+                    transfer_to_h273(cm.transfer);
+                enc_config.codec_config_av1.matrix_coefficients = cm.matrix_coefficients as u32;
+                enc_config.codec_config_av1.color_range = cm.full_range as u32;
+            } else {
+                // H.264 / H.265: the preset's GetEncodePresetConfigEx already
+                // seeded the codec config union (idrPeriod, entropy mode, VUI,
+                // SPS/PPS-at-start) with driver-blessed defaults for the codec
+                // GUID. We deliberately do NOT hand-write the H264/HEVC union
+                // (its exact SDK-13 layout would have to be mirrored byte-exact
+                // and the union slot is already filled). Output is Annex-B with
+                // SPS/PPS on the first IRAP — exactly what the muxer's nal_mux
+                // captures into avcC/hvcC. The shared gop_length above drives
+                // periodic IDRs; profile is pinned via init_params below.
+                //
+                // Force strictly 1-in-1-out so the ring-of-4 sync drain never
+                // strands buffered frames: the H.264/H.265 presets enable RC
+                // lookahead (~16 frames), which our single-pass EOS drain can't
+                // recover — observed as 84/96 frame loss (H.264) and an EOS
+                // deadlock (H.265). Clearing lookahead + setting zeroReorderDelay
+                // makes every EncodePicture emit its packet immediately.
+                enc_config.rc_params.flags &= !RC_FLAG_ENABLE_LOOKAHEAD;
+                enc_config.rc_params.flags |= RC_FLAG_ZERO_REORDER_DELAY;
+                enc_config.rc_params.lookahead_depth = 0;
+                enc_config.rc_params.multi_pass = 0; // NV_ENC_MULTI_PASS_DISABLED
+                tracing::info!(
+                    codec = ?config.codec,
+                    "NVENC H.264/H.265 using preset-seeded codec config (Annex-B, 1-in-1-out)"
+                );
+            }
 
             let mut init_params: NvEncInitializeParams = std::mem::zeroed();
             init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
-            init_params.encode_guid = NV_ENC_CODEC_AV1_GUID;
+            init_params.encode_guid = codec_guid;
+            // Pin H.264 High / H.265 Main; AV1 keeps the preset's auto profile.
+            enc_config.profile_guid = nvenc_profile_guid(config.codec);
             init_params.preset_guid = preset_guid;
             init_params.encode_width = config.width;
             init_params.encode_height = config.height;
@@ -2084,11 +2173,19 @@ impl NvencEncoder {
     unsafe fn drain_bitstream(
         session: &EncodeSession,
         slot: usize,
+        do_not_wait: bool,
     ) -> Result<Option<(u32, EncodedPacket)>> {
         unsafe {
             let bitstream_buffer = session.bitstream_buffers[slot];
             let mut lock: NvEncLockBitstream = std::mem::zeroed();
             lock.version = NV_ENC_LOCK_BITSTREAM_VER;
+            // doNotWait (bit 0 of the bitfield word): non-blocking lock. The EOS
+            // flush walks ring slots that may have no pending output — a blocking
+            // lock there busy-waits forever (the encoder produced all packets
+            // 1-in-1-out during encode, so there's nothing to flush). Per-frame
+            // drains pass false: in sync mode the output is ready right after a
+            // SUCCESS EncodePicture, so blocking returns immediately.
+            lock.bitfields = if do_not_wait { 1 } else { 0 };
             lock.output_bitstream = bitstream_buffer;
             let rc = (session.fn_lock_bitstream)(session.encoder, &mut lock);
             match rc {
@@ -2241,15 +2338,33 @@ impl NvencEncoder {
 
                 match rc {
                     NV_ENC_SUCCESS => {
-                        if let Some((frame_idx, pkt)) = Self::drain_bitstream(session, slot)? {
+                        let got = Self::drain_bitstream(session, slot, false)?;
+                        let drained = got.is_some();
+                        if let Some((frame_idx, pkt)) = got {
                             self.last_drained_frame_idx[slot] = frame_idx as i64;
                             self.encoded_packets.push(pkt);
                         }
+                        tracing::debug!(
+                            target: "nvenc_drain",
+                            frame = self.frame_counter - 1,
+                            slot,
+                            rc = "SUCCESS",
+                            drained,
+                            total_packets = self.encoded_packets.len(),
+                            "encode_picture"
+                        );
                     }
                     NV_ENC_ERR_NEED_MORE_INPUT => {
                         // Normal for initial B-frames or lookahead warmup —
                         // NVENC is accumulating frames before emitting a
                         // packet. Nothing to drain until the next frame.
+                        tracing::debug!(
+                            target: "nvenc_drain",
+                            frame = self.frame_counter - 1,
+                            slot,
+                            rc = "NEED_MORE_INPUT",
+                            "encode_picture (buffering)"
+                        );
                     }
                     other => bail!("NvEncEncodePicture failed: {other}"),
                 }
@@ -2263,6 +2378,20 @@ impl NvencEncoder {
         let Some(session) = &self.session else {
             return Ok(());
         };
+        // If every submitted frame was already drained during encode (the
+        // 1-in-1-out case forced for H.264/H.265 via zeroReorderDelay + no
+        // lookahead), there is nothing buffered to flush. Sending the EOS
+        // picture and locking the empty ring buffers busy-waits forever on the
+        // SDK 13 driver — skip it entirely.
+        if self.encoded_packets.len() >= self.frame_counter as usize {
+            tracing::info!(
+                target: "nvenc_drain",
+                packets = self.encoded_packets.len(),
+                frames = self.frame_counter,
+                "flush_eos: nothing buffered, skipping EOS drain"
+            );
+            return Ok(());
+        }
         unsafe {
             let _scope = session.ctx_scope()?;
 
@@ -2278,7 +2407,13 @@ impl NvencEncoder {
             pic.input_buffer = ptr::null_mut();
             pic.output_bitstream = session.bitstream_buffers[self.ring_idx];
             pic.buffer_fmt = session.buffer_format;
-            let _ = (session.fn_encode_picture)(session.encoder, &mut pic);
+            let eos_rc = (session.fn_encode_picture)(session.encoder, &mut pic);
+            tracing::info!(
+                target: "nvenc_drain",
+                eos_rc,
+                packets_before = self.encoded_packets.len(),
+                "flush_eos: EOS picture sent"
+            );
 
             // Walk every ring-buffer slot once. Each slot may hold at
             // most ONE pending frame that EOS just released.
@@ -2305,7 +2440,7 @@ impl NvencEncoder {
                 // be written), so the producer wrote RING_SIZE-1
                 // slots before it.
                 let slot = (self.ring_idx + i) % RING_SIZE;
-                if let Some((frame_idx, pkt)) = Self::drain_bitstream(session, slot)? {
+                if let Some((frame_idx, pkt)) = Self::drain_bitstream(session, slot, true)? {
                     // Stale-read filter: if the driver handed us back a
                     // frame_idx we've already drained from this slot,
                     // it's the previous packet bytes — see drain_bitstream
@@ -2318,6 +2453,11 @@ impl NvencEncoder {
                     }
                 }
             }
+            tracing::info!(
+                target: "nvenc_drain",
+                total_packets = self.encoded_packets.len(),
+                "flush_eos: drain complete"
+            );
         }
         Ok(())
     }

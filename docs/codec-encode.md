@@ -56,7 +56,7 @@ multi-GPU chunk-stitch path stay AV1). Per-backend status:
 | Backend | AV1 | H.264 / H.265 |
 |---------|-----|---------------|
 | **QSV** (Intel Arc+) | ✅ | ✅ **validated** — `codec_id` = AVC/HEVC, AV1 tile ext buffer skipped; emits Annex-B NAL |
-| NVENC (NVIDIA Ada+) | ✅ | ❌ rejected — native `NV_ENC_CONFIG_H264/HEVC` is a HW-verification follow-up |
+| **NVENC** (NVIDIA) | ✅ (Ada+) | ✅ **validated** — codec GUID dispatch (H.264 Kepler+, H.265 Maxwell+); preset-seeded config + 1-in-1-out drain |
 | AMF (AMD RDNA3+) | ✅ | ❌ rejected — native `VCE_AVC` / HEVC component is a follow-up |
 | ffmpeg | ✅ | ❌ rejected — `h264_*`/`hevc_*` dispatch is a follow-up |
 
@@ -64,9 +64,24 @@ H.264/H.265 encoders emit **Annex-B** NAL; the muxer's
 [`nal_mux`](../crates/container/src/nal_mux.rs) splits each packet into per-frame
 access units (HW encoders pack several frames per buffer), captures SPS/PPS(/VPS)
 for the `avcC`/`hvcC` config box, and repackages slices as length-prefixed
-samples (`avc1`/`hvc1`). The non-QSV backends reject H.264/H.265 rather than
-silently emit AV1. Validated on the 3× Arc box: H.264/H.265/AV1 each decode
-96/96 frames, 0 errors, identical PSNR-vs-source, consistent BT.709.
+samples (`avc1`/`hvc1`). AMF/ffmpeg reject H.264/H.265 rather than silently emit
+AV1.
+
+**NVENC H.264/H.265** uses the codec's GUID for capability validation, preset
+selection, and session init; the preset (`GetEncodePresetConfigEx`) seeds the
+codec config union so the H264/HEVC layout doesn't have to be mirrored. H.264 is
+pinned to High profile, H.265 to Main. The encoder is forced **strictly
+1-in-1-out** for H.264/H.265 (clear `enableLookahead`, set `zeroReorderDelay`,
+no B-frames) because the ring-of-4 sync drain emits one packet per
+`EncodePicture`; lookahead/reorder buffering would otherwise strand the tail
+frames or deadlock the EOS flush. When every frame is drained during encode, the
+EOS flush is skipped (sending it busy-waits on the SDK 13 driver).
+
+Validation:
+- **NVENC on RTX 3090** (this repo's dev box): H.264 + H.265 each decode 96/96
+  frames, 0 errors, BT.709, ~0.9 s (full NVDEC→NVENC round-trip).
+- **QSV on the 3× Arc box**: H.264/H.265/AV1 each decode 96/96 frames, 0 errors,
+  identical PSNR-vs-source, consistent BT.709.
 
 ## The encode dispatch & capability query
 
