@@ -142,7 +142,17 @@ fn find_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
 }
 
 /// Repackages Annex-B encoder frames into length-prefixed mdat samples while
-/// collecting the out-of-band parameter sets for the `avcC`/`hvcC` config box.
+/// collecting the parameter sets for the `avcC`/`hvcC` config box.
+///
+/// Two modes:
+/// - **out-of-band** (default): SPS/PPS/VPS are stripped from samples and stored
+///   in the config box. Correct for a single encoder (`avc1`/`hvc1`).
+/// - **inline** ([`new_inline`]): SPS/PPS/VPS are ALSO kept inline in each
+///   access unit (each IDR self-describes). Used by the multi-GPU stitch, where
+///   chunks come from independent encoders (possibly different vendors): the
+///   inline parameter sets let each chunk decode with its own SPS/PPS even if
+///   they differ cosmetically. Pairs with the `avc3`/`hev1` sample entry. The
+///   config box still gets the FIRST set as a default hint.
 #[derive(Debug)]
 pub struct NalSampleWriter {
     codec: NalMuxCodec,
@@ -150,11 +160,18 @@ pub struct NalSampleWriter {
     pub vps: Vec<Vec<u8>>,
     pub sps: Vec<Vec<u8>>,
     pub pps: Vec<Vec<u8>>,
+    inline_param_sets: bool,
 }
 
 impl NalSampleWriter {
     pub fn new(codec: NalMuxCodec) -> Self {
-        Self { codec, vps: Vec::new(), sps: Vec::new(), pps: Vec::new() }
+        Self { codec, vps: Vec::new(), sps: Vec::new(), pps: Vec::new(), inline_param_sets: false }
+    }
+
+    /// Inline-parameter-set mode (for the multi-GPU stitch). Keeps SPS/PPS/VPS
+    /// inline in each access unit AND records the first set for the config box.
+    pub fn new_inline(codec: NalMuxCodec) -> Self {
+        Self { codec, vps: Vec::new(), sps: Vec::new(), pps: Vec::new(), inline_param_sets: true }
     }
 
     /// Convert one encoder packet — which may carry **multiple access units**
@@ -181,22 +198,43 @@ impl NalSampleWriter {
             units.last_mut().unwrap().push(nal);
         }
 
+        let codec = self.codec;
+        let inline = self.inline_param_sets;
         let mut samples = Vec::new();
         for unit in units {
             let mut data = Vec::new();
             let mut is_keyframe = false;
             for nal in unit {
-                match classify(nal, self.codec) {
-                    NalClass::Vps => dedup_push(&mut self.vps, nal),
-                    NalClass::Sps => dedup_push(&mut self.sps, nal),
-                    NalClass::Pps => dedup_push(&mut self.pps, nal),
+                let push_inline = |data: &mut Vec<u8>| {
+                    data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                    data.extend_from_slice(nal);
+                };
+                match classify(nal, codec) {
                     NalClass::Sample => {
-                        if is_idr(nal, self.codec) {
+                        if is_idr(nal, codec) {
                             is_keyframe = true;
                         }
-                        data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-                        data.extend_from_slice(nal);
+                        push_inline(&mut data);
+                        continue;
                     }
+                    NalClass::Vps | NalClass::Sps | NalClass::Pps => {}
+                }
+                // A parameter set (SPS/PPS/VPS):
+                let store = match classify(nal, codec) {
+                    NalClass::Vps => &mut self.vps,
+                    NalClass::Sps => &mut self.sps,
+                    NalClass::Pps => &mut self.pps,
+                    NalClass::Sample => unreachable!(),
+                };
+                if inline {
+                    // Record the first of each kind for the config-box default,
+                    // and keep every parameter set inline in the access unit.
+                    if store.is_empty() {
+                        store.push(nal.to_vec());
+                    }
+                    push_inline(&mut data);
+                } else {
+                    dedup_push(store, nal);
                 }
             }
             if !data.is_empty() {
@@ -280,6 +318,39 @@ mod tests {
         assert_eq!(samples.len(), 2, "two AUDs → two samples");
         assert!(samples[0].is_keyframe, "AU1 has the IDR");
         assert!(!samples[1].is_keyframe, "AU2 is a P-frame");
+    }
+
+    #[test]
+    fn inline_mode_keeps_param_sets_in_sample() {
+        // Multi-GPU stitch: each access unit must self-describe with its own
+        // SPS/PPS (avc3/hev1), so a chunk decodes with its own parameter sets.
+        let sps = [0x67u8, 0x42, 0x00, 0x1e, 0xAA];
+        let pps = [0x68u8, 0xCE, 0x3C];
+        let idr = [0x65u8, 0x88, 0x11, 0x22];
+        let mut frame = sc4(&sps);
+        frame.extend(sc4(&pps));
+        frame.extend(sc4(&idr));
+
+        let mut w = NalSampleWriter::new_inline(NalMuxCodec::H264);
+        let inline = w.push_packet(&frame);
+        assert_eq!(inline.len(), 1);
+        assert!(inline[0].is_keyframe);
+        // Config box still records the first SPS/PPS as a default hint.
+        assert_eq!(w.sps.len(), 1);
+        assert!(w.sps[0].starts_with(&sps));
+        assert_eq!(w.pps.len(), 1);
+
+        // Out-of-band mode strips the params, so its sample is smaller.
+        let mut w2 = NalSampleWriter::new(NalMuxCodec::H264);
+        let oob = w2.push_packet(&frame);
+        assert!(
+            inline[0].data.len() > oob[0].data.len(),
+            "inline sample (SPS+PPS+IDR) must be larger than the stripped one ({} vs {})",
+            inline[0].data.len(),
+            oob[0].data.len()
+        );
+        // The inline sample begins with the length-prefixed SPS bytes.
+        assert_eq!(&inline[0].data[4..4 + sps.len()], &sps);
     }
 
     #[test]

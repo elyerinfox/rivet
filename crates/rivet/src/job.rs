@@ -404,8 +404,11 @@ fn mux_rung_packets_to_mp4(
     color_metadata: ColorMetadata,
     audio: Option<&PreparedAudio>,
 ) -> Result<RungOutput> {
-    let mut muxer = Av1Mp4Muxer::new_with_codec(rp.width, rp.height, frame_rate, rp.codec)
-        .context("Av1Mp4Muxer::new_with_codec")?;
+    // Multi-GPU stitch: chunks come from independent encoders (possibly
+    // different vendors), so keep parameter sets inline per access unit
+    // (avc3/hev1 for H.264/H.265). AV1 ignores the flag (it stores OBUs verbatim).
+    let mut muxer = Av1Mp4Muxer::new_with_codec_inline(rp.width, rp.height, frame_rate, rp.codec)
+        .context("Av1Mp4Muxer::new_with_codec_inline")?;
     muxer.set_color_metadata(color_metadata);
     if let Some(a) = audio {
         if let Err(e) = muxer.with_audio(a.info.clone()) {

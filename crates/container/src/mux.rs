@@ -73,6 +73,10 @@ pub struct Av1Mp4Muxer {
     /// length-prefixed mdat samples and collects the SPS/PPS(/VPS) for the
     /// config box. `None` for AV1 (which stores OBUs verbatim).
     nal_writer: Option<NalSampleWriter>,
+    /// Inline-parameter-set mode (H.264/H.265 multi-GPU stitch): keep SPS/PPS
+    /// inline per access unit + emit the `avc3`/`hev1` sample entry instead of
+    /// `avc1`/`hvc1`, so chunks from independent encoders self-describe.
+    inline_param_sets: bool,
 }
 
 /// Per-muxer audio track state: info + spooling tempfile + per-sample
@@ -130,15 +134,45 @@ impl Av1Mp4Muxer {
         frame_rate: f64,
         codec: VideoCodec,
     ) -> Result<Self> {
+        Self::new_with_codec_opts(width, height, frame_rate, codec, false)
+    }
+
+    /// Like [`new_with_codec`] but with **inline parameter sets** for H.264/H.265
+    /// (the multi-GPU stitch). Each access unit keeps its own SPS/PPS(/VPS) and
+    /// the sample entry is `avc3`/`hev1`, so chunks from independent encoders
+    /// (possibly different vendors) decode with their own parameter sets.
+    pub fn new_with_codec_inline(
+        width: u32,
+        height: u32,
+        frame_rate: f64,
+        codec: VideoCodec,
+    ) -> Result<Self> {
+        Self::new_with_codec_opts(width, height, frame_rate, codec, true)
+    }
+
+    fn new_with_codec_opts(
+        width: u32,
+        height: u32,
+        frame_rate: f64,
+        codec: VideoCodec,
+        inline_param_sets: bool,
+    ) -> Result<Self> {
         let mdat_tmp = NamedTempFile::new().context("creating mdat tempfile")?;
         let handle = mdat_tmp
             .reopen()
             .context("reopening mdat tempfile for write")?;
         let mdat_writer = BufWriter::new(handle);
+        let make = |c: NalMuxCodec| {
+            if inline_param_sets {
+                NalSampleWriter::new_inline(c)
+            } else {
+                NalSampleWriter::new(c)
+            }
+        };
         let nal_writer = match codec {
             VideoCodec::Av1 => None,
-            VideoCodec::H264 => Some(NalSampleWriter::new(NalMuxCodec::H264)),
-            VideoCodec::H265 => Some(NalSampleWriter::new(NalMuxCodec::H265)),
+            VideoCodec::H264 => Some(make(NalMuxCodec::H264)),
+            VideoCodec::H265 => Some(make(NalMuxCodec::H265)),
         };
         Ok(Self {
             width,
@@ -156,6 +190,7 @@ impl Av1Mp4Muxer {
             force_largesize_mdat: false,
             codec,
             nal_writer,
+            inline_param_sets,
         })
     }
 
@@ -640,7 +675,10 @@ impl Av1Mp4Muxer {
                     anyhow::bail!("H.264 mux: no SPS/PPS captured from the encoder bitstream");
                 }
                 let avcc = build_avcc(&w.sps, &w.pps);
-                build_avc1(self.width, self.height, &avcc, &self.color_metadata)
+                // `avc3` signals in-band parameter sets (inline-stitch mode);
+                // `avc1` requires them out-of-band only.
+                let fourcc = if self.inline_param_sets { b"avc3" } else { b"avc1" };
+                build_avc1(self.width, self.height, &avcc, &self.color_metadata, fourcc)
             }
             VideoCodec::H265 => {
                 let w = self.nal_writer.as_ref().context("H.265 nal writer missing")?;
@@ -648,7 +686,9 @@ impl Av1Mp4Muxer {
                     anyhow::bail!("H.265 mux: no VPS/SPS/PPS captured from the encoder bitstream");
                 }
                 let hvcc = build_hvcc(&w.vps, &w.sps, &w.pps);
-                build_hvc1(self.width, self.height, &hvcc, &self.color_metadata)
+                // `hev1` signals in-band parameter sets; `hvc1` is out-of-band.
+                let fourcc = if self.inline_param_sets { b"hev1" } else { b"hvc1" };
+                build_hvc1(self.width, self.height, &hvcc, &self.color_metadata, fourcc)
             }
         };
 
@@ -2230,27 +2270,32 @@ fn strip_emulation(data: &[u8]) -> Vec<u8> {
 }
 
 /// H.264 `avc1` visual sample entry (avcC + colr [+ HDR atoms]).
+/// H.264 visual sample entry (avcC + colr [+ HDR atoms]). `fourcc` is `avc1`
+/// (out-of-band parameter sets) or `avc3` (in-band, for the inline stitch).
 pub(crate) fn build_avc1(
     width: u32,
     height: u32,
     avcc: &[u8],
     color_metadata: &ColorMetadata,
+    fourcc: &[u8; 4],
 ) -> Vec<u8> {
-    let mut b = BoxBuilder::new(b"avc1");
+    let mut b = BoxBuilder::new(fourcc);
     push_visual_sample_entry_header(&mut b, width, height);
     b.extend(avcc);
     push_color_boxes(&mut b, color_metadata);
     b.finish()
 }
 
-/// H.265 `hvc1` visual sample entry (hvcC + colr [+ HDR atoms]).
+/// H.265 visual sample entry (hvcC + colr [+ HDR atoms]). `fourcc` is `hvc1`
+/// (out-of-band parameter sets) or `hev1` (in-band, for the inline stitch).
 pub(crate) fn build_hvc1(
     width: u32,
     height: u32,
     hvcc: &[u8],
     color_metadata: &ColorMetadata,
+    fourcc: &[u8; 4],
 ) -> Vec<u8> {
-    let mut b = BoxBuilder::new(b"hvc1");
+    let mut b = BoxBuilder::new(fourcc);
     push_visual_sample_entry_header(&mut b, width, height);
     b.extend(hvcc);
     push_color_boxes(&mut b, color_metadata);
