@@ -1112,6 +1112,17 @@ pub struct NvencEncoder {
 
 impl NvencEncoder {
     pub fn new(config: EncoderConfig, gpu_index: u32) -> Result<Self> {
+        // NVENC currently encodes AV1 only. H.264/H.265 output is validated on
+        // Intel QSV; native NVENC H.264/H.265 (the NV_ENC_CONFIG_H264/HEVC config
+        // union) is a hardware-verification follow-up. Reject rather than
+        // silently emit AV1 for a non-AV1 request.
+        if config.codec != crate::frame::VideoCodec::Av1 {
+            anyhow::bail!(
+                "NVENC encodes AV1 only today; for {:?} output use Intel QSV (Arc+) \
+                 — native NVENC H.264/H.265 is a follow-up",
+                config.codec
+            );
+        }
         // Take the SHARED CUDA-init lock BEFORE any FFI work. This
         // serializes encoder construction not just against other
         // encoders but ALSO against NVDEC streaming-decoder ctor —

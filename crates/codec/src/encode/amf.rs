@@ -621,6 +621,17 @@ pub struct AmfEncoder {
 
 impl AmfEncoder {
     pub fn new(config: EncoderConfig, gpu_index: u32) -> Result<Self> {
+        // AMF currently encodes AV1 only (AMFVideoEncoderVCN_AV1). H.264/H.265
+        // output is validated on Intel QSV; native AMF H.264 (VCE_AVC) / H.265
+        // (HEVC) is a hardware-verification follow-up (no AMD card here). Reject
+        // rather than silently emit AV1 for a non-AV1 request.
+        if config.codec != crate::frame::VideoCodec::Av1 {
+            anyhow::bail!(
+                "AMF encodes AV1 only today; for {:?} output use Intel QSV (Arc+) \
+                 — native AMF H.264/H.265 is a follow-up",
+                config.codec
+            );
+        }
         // 1. dlopen the AMF runtime. On Linux the library name is
         //    `libamfrt64.so.1`; on Windows it's `amfrt64.dll`. Both
         //    ship with the Adrenalin driver and Pro driver bundles.

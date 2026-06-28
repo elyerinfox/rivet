@@ -116,6 +116,16 @@ pub struct FfmpegEncoder {
 
 impl FfmpegEncoder {
     pub fn new(config: EncoderConfig) -> Result<Self> {
+        // This wrapper drives libavcodec's AV1 encoder catalogue only. H.264/
+        // H.265 output is validated on the native Intel QSV path; routing
+        // H.264/H.265 through libavcodec's h264_*/hevc_* encoders is a follow-up.
+        if config.codec != crate::frame::VideoCodec::Av1 {
+            anyhow::bail!(
+                "the ffmpeg encoder wrapper emits AV1 only today; for {:?} output use \
+                 Intel QSV (Arc+) — h264_*/hevc_* dispatch is a follow-up",
+                config.codec
+            );
+        }
         init_ffmpeg();
 
         let input_pix_fmt = match config.pixel_format {

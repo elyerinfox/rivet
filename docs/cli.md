@@ -55,6 +55,7 @@ Transcodes `<INPUT>` (any supported container/codec) to AV1.
 | `--color <POLICY>` | `sdr` *(default)*, `hdr10`, `hlg`, `passthrough` | Output color / tonemap policy — see [Color & bit depth](#color--bit-depth). |
 | `--pixel-format <FMT>` | `auto` *(default)*, `8bit`, `10bit` | Output luma bit depth. |
 | `--filter <CHAIN>` | e.g. `crop=1280:720,hflip` | Video filter chain applied before scaling — see [Video filters](filters.md). |
+| `--codec <CODEC>` | `av1` *(default)*, `h264`, `h265` | Output video codec. `av1` is royalty-clean (the project default); `h264`/`h265` are for legacy-player compatibility and are **single-file MP4 only** (not HLS), encoded on **Intel QSV** today (NVENC/AMF H.264/H.265 is a follow-up). |
 
 ### GPU selection
 
