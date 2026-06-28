@@ -15,11 +15,9 @@
 //! - AVC: RFC 6381 §3.3 (`avc1.PPCCLL` hex from SPS)
 //! - HEVC: ISO/IEC 14496-15 §A.5
 //!
-//! We currently emit AV1 and AAC strings. AVC / HEVC formatters are
-//! sketched as future work for when those codecs ride through the
-//! pipeline as outputs.
+//! Emits AV1, H.264 (`avc1`/`avc3`), H.265 (`hvc1`/`hev1`), and AAC strings.
 
-use crate::pixel_format::Av1SequenceHeader;
+use crate::pixel_format::{Av1SequenceHeader, H264SpsInfo, HevcSpsInfo};
 
 /// AV1 codec string — `av01.P.LLT.DD.M.CCC.TTT.MMM.F`.
 ///
@@ -87,6 +85,56 @@ pub fn av1_codec_string(h: &Av1SequenceHeader) -> String {
     }
 }
 
+/// H.264 codec string `<fourcc>.PPCCLL` per RFC 6381 §3.3 — hex bytes from the
+/// SPS: `PP` = `profile_idc`, `CC` = the packed `constraint_set` flags byte,
+/// `LL` = `level_idc`. `fourcc` is the sample-entry type: `avc1` (parameter sets
+/// out-of-band in `avcC`) or `avc3` (in-band). Example: High@L4.0 → `avc1.640028`.
+pub fn avc_codec_string(fourcc: &str, sps: &H264SpsInfo) -> String {
+    format!(
+        "{}.{:02X}{:02X}{:02X}",
+        fourcc, sps.profile_idc, sps.constraint_set_flags, sps.level_idc
+    )
+}
+
+/// H.265 codec string `<fourcc>.{space}{profile}.{compat}.{tier}{level}{.cons}*`
+/// per ISO/IEC 14496-15 §E.3, parsed from the SPS profile_tier_level:
+///   - `{space}` = `general_profile_space` as a letter (0 → omitted, 1→'A', …),
+///     then `general_profile_idc` in decimal.
+///   - `{compat}` = `general_profile_compatibility_flags` with its 32-bit order
+///     **reversed**, in hex with leading zeros omitted (Main → `6`).
+///   - `{tier}{level}` = 'L'/'H' from `general_tier_flag` + `general_level_idc`
+///     in decimal (L4.0 → `L120`, L3.1 → `L93`).
+///   - `{.cons}*` = the six `general_constraint_indicator_flags` bytes, each a
+///     `.XX` hex segment, trailing zero bytes omitted.
+/// `fourcc` is `hvc1` (out-of-band) or `hev1` (in-band). Example: Main@L3.1
+/// progressive → `hvc1.1.6.L93.B0`.
+pub fn hevc_codec_string(fourcc: &str, sps: &HevcSpsInfo) -> String {
+    let space = match sps.general_profile_space {
+        0 => String::new(),
+        n => ((b'A' + n - 1) as char).to_string(),
+    };
+    let compat = sps.profile_compatibility_flags.reverse_bits();
+    let tier = if sps.tier_flag { 'H' } else { 'L' };
+    let bytes = [
+        (sps.general_constraint_flags >> 40) as u8,
+        (sps.general_constraint_flags >> 32) as u8,
+        (sps.general_constraint_flags >> 24) as u8,
+        (sps.general_constraint_flags >> 16) as u8,
+        (sps.general_constraint_flags >> 8) as u8,
+        sps.general_constraint_flags as u8,
+    ];
+    let mut cons = String::new();
+    if let Some(end) = bytes.iter().rposition(|&b| b != 0) {
+        for b in &bytes[..=end] {
+            cons.push_str(&format!(".{b:02X}"));
+        }
+    }
+    format!(
+        "{}.{}{}.{:X}.{}{}{}",
+        fourcc, space, sps.profile_idc, compat, tier, sps.level_idc, cons
+    )
+}
+
 /// AAC-LC in MP4 codec string. Always `mp4a.40.2`:
 ///   - `mp4a` = ISO/IEC 14496 sample entry fourcc
 ///   - `40`   = ObjectTypeIndication for MPEG-4 Audio (decimal 64,
@@ -112,6 +160,59 @@ pub fn hls_codecs_attribute(video: &str, audio: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avc_codec_string_high_l40() {
+        let sps = H264SpsInfo {
+            profile_idc: 100, // High = 0x64
+            constraint_set_flags: 0x00,
+            level_idc: 40, // L4.0 = 0x28
+            ..Default::default()
+        };
+        assert_eq!(avc_codec_string("avc1", &sps), "avc1.640028");
+        assert_eq!(avc_codec_string("avc3", &sps), "avc3.640028");
+    }
+
+    #[test]
+    fn avc_codec_string_baseline_constrained() {
+        let sps = H264SpsInfo {
+            profile_idc: 66, // Baseline = 0x42
+            constraint_set_flags: 0xC0, // constraint_set0+1
+            level_idc: 30, // 0x1E
+            ..Default::default()
+        };
+        assert_eq!(avc_codec_string("avc1", &sps), "avc1.42C01E");
+    }
+
+    #[test]
+    fn hevc_codec_string_main_l31() {
+        // Well-known Main@L3.1 progressive string: hvc1.1.6.L93.B0
+        let sps = HevcSpsInfo {
+            general_profile_space: 0,
+            profile_idc: 1,
+            profile_compatibility_flags: 0x6000_0000, // flags[1]+[2] → reversed = 0x6
+            tier_flag: false,
+            level_idc: 93,
+            general_constraint_flags: 0xB000_0000_0000, // first byte 0xB0, rest zero
+            ..Default::default()
+        };
+        assert_eq!(hevc_codec_string("hvc1", &sps), "hvc1.1.6.L93.B0");
+        assert_eq!(hevc_codec_string("hev1", &sps), "hev1.1.6.L93.B0");
+    }
+
+    #[test]
+    fn hevc_codec_string_main10_high_tier_no_constraints() {
+        let sps = HevcSpsInfo {
+            general_profile_space: 0,
+            profile_idc: 2, // Main 10
+            profile_compatibility_flags: 0x2000_0000, // flags[2] → reversed = 0x4
+            tier_flag: true, // High tier
+            level_idc: 120, // L4.0
+            general_constraint_flags: 0, // all zero → no trailing .XX
+            ..Default::default()
+        };
+        assert_eq!(hevc_codec_string("hvc1", &sps), "hvc1.2.4.H120");
+    }
 
     fn synth_seq_header(
         seq_profile: u8,

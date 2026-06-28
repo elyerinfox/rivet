@@ -609,7 +609,7 @@ async fn run_hls(
 }
 
 fn build_video_variant_spec(rm: &RungManifest, frame_rate: f64, bytes: u64) -> VideoVariantSpec {
-    let codec_string = cmaf_util::av1_codec_string_from_init(&rm.manifest.init_path)
+    let codec_string = cmaf_util::codec_string_from_init(&rm.manifest.init_path)
         .unwrap_or_else(|_| "av01.0.08M.08.0.110.01.01.01.0".to_string());
     let (_avg, peak) = cmaf_util::measure_bandwidth(&rm.manifest);
     let bandwidth = if peak > 0 {

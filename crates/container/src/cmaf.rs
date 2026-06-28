@@ -49,13 +49,17 @@
 //! u32 by hand.
 
 use anyhow::{Context, Result};
-use codec::frame::ColorMetadata;
+use codec::frame::{ColorMetadata, VideoCodec};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::AudioInfo;
-use crate::mux::{BoxBuilder, build_audio_stsd, build_av01, write_unity_matrix};
+use crate::mux::{
+    BoxBuilder, build_audio_stsd, build_av01, build_avc1, build_avcc, build_hvc1, build_hvcc,
+    write_unity_matrix,
+};
+use crate::nal_mux::{NalMuxCodec, NalSampleWriter};
 
 /// CMAF brand identifiers used in `ftyp.compatible_brands`.
 pub mod brand {
@@ -559,21 +563,28 @@ pub fn build_init_segment_video(
     config_obus: &[u8],
     color_metadata: &ColorMetadata,
 ) -> Vec<u8> {
+    let av01 = build_av01(width, height, config_obus, color_metadata);
+    build_init_segment_video_with_entry(width, height, timescale, &av01, b"av01")
+}
+
+/// Build a CMAF video init segment from a pre-built **visual sample entry**
+/// (`av01` / `avc1` / `avc3` / `hvc1` / `hev1`, with its config box + colr
+/// already inside) and the `ftyp` codec brand. Codec-agnostic — the caller
+/// constructs the sample entry for AV1 / H.264 / H.265.
+pub fn build_init_segment_video_with_entry(
+    width: u32,
+    height: u32,
+    timescale: u32,
+    sample_entry: &[u8],
+    codec_brand: &[u8; 4],
+) -> Vec<u8> {
     let track_id = 1u32;
 
-    // ftyp — major_brand=iso6, brands include cmfc + av01
-    let ftyp = build_ftyp_video();
+    let ftyp = build_ftyp_video(codec_brand);
 
     // moov children
     let mvhd = build_mvhd(timescale, /* duration */ 0, /* next_track_id */ 2);
-    let trak = build_video_trak(
-        width,
-        height,
-        timescale,
-        track_id,
-        config_obus,
-        color_metadata,
-    );
+    let trak = build_video_trak(width, height, timescale, track_id, sample_entry);
     let mvex_blob = {
         let mehd = build_mehd(0);
         // For video, default sample flags are delta-frame (most samples
@@ -632,10 +643,10 @@ pub fn build_init_segment_audio(audio_info: &AudioInfo) -> Vec<u8> {
 }
 
 /// `ftyp` for a video init segment. Brands declare `cmfc` (CMAF video
-/// constraints), `av01` (AV1-in-MP4), plus `iso6` / `mp42` / `iso2` for
-/// broad parser compatibility. Major brand is `iso6` (CMAF / 14496-12
-/// edition 6) — Apple's player and ffmpeg both honour it.
-fn build_ftyp_video() -> Vec<u8> {
+/// constraints), the codec brand (`av01` / `avc1` / `hvc1`), plus `iso6` /
+/// `mp42` / `iso2` for broad parser compatibility. Major brand is `iso6` (CMAF /
+/// 14496-12 edition 6) — Apple's player and ffmpeg both honour it.
+fn build_ftyp_video(codec_brand: &[u8; 4]) -> Vec<u8> {
     let mut b = BoxBuilder::new(b"ftyp");
     b.extend(b"iso6"); // major_brand
     b.u32(0); // minor_version
@@ -643,7 +654,7 @@ fn build_ftyp_video() -> Vec<u8> {
     b.extend(b"iso2");
     b.extend(b"mp42");
     b.extend(brand::CMFC);
-    b.extend(b"av01");
+    b.extend(codec_brand);
     b.finish()
 }
 
@@ -690,11 +701,10 @@ fn build_video_trak(
     height: u32,
     timescale: u32,
     track_id: u32,
-    config_obus: &[u8],
-    color_metadata: &ColorMetadata,
+    sample_entry: &[u8],
 ) -> Vec<u8> {
     let tkhd = build_video_tkhd(width, height, track_id);
-    let mdia = build_video_mdia(width, height, timescale, config_obus, color_metadata);
+    let mdia = build_video_mdia(timescale, sample_entry);
     let mut b = BoxBuilder::new(b"trak");
     b.extend(&tkhd);
     b.extend(&mdia);
@@ -725,16 +735,10 @@ fn build_video_tkhd(width: u32, height: u32, track_id: u32) -> Vec<u8> {
     b.finish()
 }
 
-fn build_video_mdia(
-    width: u32,
-    height: u32,
-    timescale: u32,
-    config_obus: &[u8],
-    color_metadata: &ColorMetadata,
-) -> Vec<u8> {
+fn build_video_mdia(timescale: u32, sample_entry: &[u8]) -> Vec<u8> {
     let mdhd = build_mdhd(timescale, 0);
     let hdlr = build_hdlr(b"vide", "VideoHandler\0");
-    let minf = build_video_minf(width, height, config_obus, color_metadata);
+    let minf = build_video_minf(sample_entry);
     let mut b = BoxBuilder::new(b"mdia");
     b.extend(&mdhd);
     b.extend(&hdlr);
@@ -771,15 +775,10 @@ fn build_hdlr(handler_type: &[u8; 4], name: &str) -> Vec<u8> {
     b.finish()
 }
 
-fn build_video_minf(
-    width: u32,
-    height: u32,
-    config_obus: &[u8],
-    color_metadata: &ColorMetadata,
-) -> Vec<u8> {
+fn build_video_minf(sample_entry: &[u8]) -> Vec<u8> {
     let vmhd = build_vmhd();
     let dinf = build_dinf();
-    let stbl = build_video_stbl_empty(width, height, config_obus, color_metadata);
+    let stbl = build_video_stbl_empty(sample_entry);
     let mut b = BoxBuilder::new(b"minf");
     b.extend(&vmhd);
     b.extend(&dinf);
@@ -832,19 +831,13 @@ fn build_dinf() -> Vec<u8> {
 /// Empty sample tables for a CMAF video init: `stsd` has the av01
 /// sample entry (with av1C, colr, optional mdcv/clli) and the rest of
 /// the tables are empty boxes (entry_count=0).
-fn build_video_stbl_empty(
-    width: u32,
-    height: u32,
-    config_obus: &[u8],
-    color_metadata: &ColorMetadata,
-) -> Vec<u8> {
-    let av01 = build_av01(width, height, config_obus, color_metadata);
+fn build_video_stbl_empty(sample_entry: &[u8]) -> Vec<u8> {
     let stsd = {
         let mut b = BoxBuilder::new(b"stsd");
         b.u8(0);
         b.extend(&[0, 0, 0]);
         b.u32(1); // entry_count
-        b.extend(&av01);
+        b.extend(sample_entry);
         b.finish()
     };
     let stts = build_empty_full_box(b"stts");
@@ -1044,7 +1037,15 @@ pub struct CmafVideoMuxer {
     timescale: u32,
     color_metadata: ColorMetadata,
     track_id: u32,
-    config_obus: Option<Vec<u8>>, // captured from the first packet
+    /// Output codec. `Av1` stores OBUs verbatim + builds `av01`/`av1C`;
+    /// `H264`/`H265` repackage Annex-B → length-prefixed via `nal_writer` and
+    /// build `avc3`/`hev1` init segments with inline parameter sets.
+    codec: VideoCodec,
+    /// AV1 only: the OBU sequence header captured from the first packet.
+    config_obus: Option<Vec<u8>>,
+    /// H.264/H.265 only: Annex-B → length-prefixed repackaging + SPS/PPS(/VPS)
+    /// capture (inline mode — each segment self-describes; `avc3`/`hev1`).
+    nal_writer: Option<NalSampleWriter>,
     init_path: PathBuf,
     init_written: bool,
     sequence_number: u32,
@@ -1128,6 +1129,30 @@ impl CmafVideoMuxer {
         color_metadata: ColorMetadata,
         options: CmafVideoMuxerOptions,
     ) -> Result<Self> {
+        Self::new_with_codec_options(
+            output_dir,
+            width,
+            height,
+            timescale,
+            color_metadata,
+            VideoCodec::Av1,
+            options,
+        )
+    }
+
+    /// Codec-aware constructor. `Av1` matches the legacy behaviour; `H264` /
+    /// `H265` build `avc3` / `hev1` init segments and repackage the encoder's
+    /// Annex-B packets into length-prefixed samples with inline parameter sets
+    /// (each segment self-describes — robust across the multi-GPU helper path).
+    pub fn new_with_codec_options(
+        output_dir: impl AsRef<Path>,
+        width: u32,
+        height: u32,
+        timescale: u32,
+        color_metadata: ColorMetadata,
+        codec: VideoCodec,
+        options: CmafVideoMuxerOptions,
+    ) -> Result<Self> {
         assert!(
             options.first_segment_index >= 1,
             "first_segment_index is 1-based; got {}",
@@ -1137,6 +1162,13 @@ impl CmafVideoMuxer {
         fs::create_dir_all(&output_dir)
             .with_context(|| format!("creating CMAF video output dir: {}", output_dir.display()))?;
         let init_path = output_dir.join("init.mp4");
+        // H.264/H.265 use inline parameter sets (avc3/hev1) so each segment —
+        // and each independently-encoded multi-GPU chunk — self-describes.
+        let nal_writer = match codec {
+            VideoCodec::Av1 => None,
+            VideoCodec::H264 => Some(NalSampleWriter::new_inline(NalMuxCodec::H264)),
+            VideoCodec::H265 => Some(NalSampleWriter::new_inline(NalMuxCodec::H265)),
+        };
         Ok(Self {
             output_dir,
             width,
@@ -1144,7 +1176,9 @@ impl CmafVideoMuxer {
             timescale,
             color_metadata,
             track_id: 1,
+            codec,
             config_obus: None,
+            nal_writer,
             init_path,
             // When write_init_segment is false, mark init as already
             // written so `ensure_init_written` is a no-op. The primary
@@ -1170,16 +1204,35 @@ impl CmafVideoMuxer {
     /// will produce a CMAF segment that doesn't decode (the spec
     /// requires every segment to start with a sync sample).
     pub fn add_packet(&mut self, payload: Vec<u8>, duration: u32, is_keyframe: bool) -> Result<()> {
-        if self.config_obus.is_none() {
-            self.config_obus = Some(crate::mux::extract_sequence_header(&payload).context(
-                "extracting AV1 sequence header from first packet for av1C config record",
-            )?);
+        match &mut self.nal_writer {
+            None => {
+                // AV1: capture the OBU sequence header once; store OBUs verbatim.
+                if self.config_obus.is_none() {
+                    self.config_obus = Some(crate::mux::extract_sequence_header(&payload).context(
+                        "extracting AV1 sequence header from first packet for av1C config record",
+                    )?);
+                }
+                self.pending.push(PendingVideoSample {
+                    payload,
+                    duration,
+                    is_keyframe,
+                });
+            }
+            Some(writer) => {
+                // H.264/H.265: split the Annex-B packet into access units (one
+                // per frame); each becomes a length-prefixed sample carrying its
+                // own inline SPS/PPS. Per-AU keyframe (IDR) detection comes from
+                // the bitstream, not the caller's flag. Each frame keeps the
+                // full per-frame `duration` (a packet may hold several frames).
+                for au in writer.push_packet(&payload) {
+                    self.pending.push(PendingVideoSample {
+                        payload: au.data,
+                        duration,
+                        is_keyframe: au.is_keyframe,
+                    });
+                }
+            }
         }
-        self.pending.push(PendingVideoSample {
-            payload,
-            duration,
-            is_keyframe,
-        });
         Ok(())
     }
 
@@ -1333,19 +1386,57 @@ impl CmafVideoMuxer {
         if self.init_written {
             return Ok(());
         }
-        let config = self.config_obus.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot write CMAF video init segment: no AV1 sequence header has been observed yet \
-                 (must call add_packet at least once before flush_segment / finalize)"
-            )
-        })?;
-        let init = build_init_segment_video(
-            self.width,
-            self.height,
-            self.timescale,
-            config,
-            &self.color_metadata,
-        );
+        let init = match self.codec {
+            VideoCodec::Av1 => {
+                let config = self.config_obus.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cannot write CMAF video init segment: no AV1 sequence header has been \
+                         observed yet (call add_packet before flush_segment / finalize)"
+                    )
+                })?;
+                build_init_segment_video(
+                    self.width,
+                    self.height,
+                    self.timescale,
+                    config,
+                    &self.color_metadata,
+                )
+            }
+            VideoCodec::H264 => {
+                let w = self.nal_writer.as_ref().context("H.264 CMAF nal writer missing")?;
+                if !w.has_param_sets() {
+                    anyhow::bail!("cannot write CMAF H.264 init segment: no SPS/PPS observed yet");
+                }
+                let avcc = build_avcc(&w.sps, &w.pps);
+                // avc3 sample entry (in-band parameter sets); avc1 ftyp brand.
+                let entry = build_avc1(self.width, self.height, &avcc, &self.color_metadata, b"avc3");
+                build_init_segment_video_with_entry(
+                    self.width,
+                    self.height,
+                    self.timescale,
+                    &entry,
+                    b"avc1",
+                )
+            }
+            VideoCodec::H265 => {
+                let w = self.nal_writer.as_ref().context("H.265 CMAF nal writer missing")?;
+                if !w.has_param_sets() {
+                    anyhow::bail!(
+                        "cannot write CMAF H.265 init segment: no VPS/SPS/PPS observed yet"
+                    );
+                }
+                let hvcc = build_hvcc(&w.vps, &w.sps, &w.pps);
+                // hev1 sample entry (in-band parameter sets); hvc1 ftyp brand.
+                let entry = build_hvc1(self.width, self.height, &hvcc, &self.color_metadata, b"hev1");
+                build_init_segment_video_with_entry(
+                    self.width,
+                    self.height,
+                    self.timescale,
+                    &entry,
+                    b"hvc1",
+                )
+            }
+        };
         let mut file = File::create(&self.init_path).with_context(|| {
             format!(
                 "creating CMAF video init segment: {}",
@@ -1942,6 +2033,69 @@ mod tests {
         assert_eq!(manifest.segments.len(), 1);
         assert_eq!(manifest.timescale, 30000);
         assert!((manifest.duration_seconds() - 0.1).abs() < 1e-6); // 3000/30000 = 0.1s
+    }
+
+    #[test]
+    fn cmaf_h264_init_segment_is_avc3_with_inline_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut muxer = CmafVideoMuxer::new_with_codec_options(
+            dir.path(),
+            1280,
+            720,
+            30000,
+            ColorMetadata::default(),
+            VideoCodec::H264,
+            CmafVideoMuxerOptions::default(),
+        )
+        .unwrap();
+        // Synthetic Annex-B keyframe AU: SPS (7) + PPS (8) + IDR (5).
+        let mut kf = vec![0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e, 0xAA]; // SPS
+        kf.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xCE, 0x3C]); // PPS
+        kf.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x11, 0x22]); // IDR slice
+        muxer.add_packet(kf, 1000, true).unwrap();
+        muxer
+            .add_packet(vec![0, 0, 0, 1, 0x41, 0x9a, 0x33], 1000, false) // P-slice
+            .unwrap();
+        let info = muxer.flush_segment().unwrap().expect("segment flushed");
+        assert!(info.path.exists());
+        let manifest = muxer.finalize().unwrap();
+        assert_eq!(manifest.segments.len(), 1);
+
+        let has = |buf: &[u8], pat: &[u8; 4]| buf.windows(4).any(|w| w == pat);
+        let init = std::fs::read(dir.path().join("init.mp4")).unwrap();
+        assert!(has(&init, b"avc3"), "H.264 CMAF init must use the avc3 sample entry");
+        assert!(has(&init, b"avcC"), "init must carry the avcC config box");
+        assert!(!has(&init, b"av01"), "must NOT contain an av01 box");
+        let seg = std::fs::read(&info.path).unwrap();
+        assert!(has(&seg, b"moof") && has(&seg, b"mdat"));
+    }
+
+    #[test]
+    fn cmaf_h265_init_segment_is_hev1() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut muxer = CmafVideoMuxer::new_with_codec_options(
+            dir.path(),
+            1280,
+            720,
+            30000,
+            ColorMetadata::default(),
+            VideoCodec::H265,
+            CmafVideoMuxerOptions::default(),
+        )
+        .unwrap();
+        // Synthetic HEVC keyframe AU: VPS (32) + SPS (33) + PPS (34) + IDR (19).
+        let mut kf = vec![0, 0, 0, 1, 0x40, 0x01, 0x0c]; // VPS
+        kf.extend_from_slice(&[0, 0, 0, 1, 0x42, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03]); // SPS
+        kf.extend_from_slice(&[0, 0, 0, 1, 0x44, 0x01, 0xc1]); // PPS
+        kf.extend_from_slice(&[0, 0, 0, 1, 0x26, 0x01, 0xaf]); // IDR_W_RADL slice (type 19)
+        muxer.add_packet(kf, 1000, true).unwrap();
+        let info = muxer.flush_segment().unwrap().expect("segment flushed");
+        let _ = muxer.finalize().unwrap();
+        let has = |buf: &[u8], pat: &[u8; 4]| buf.windows(4).any(|w| w == pat);
+        let init = std::fs::read(dir.path().join("init.mp4")).unwrap();
+        assert!(has(&init, b"hev1"), "H.265 CMAF init must use the hev1 sample entry");
+        assert!(has(&init, b"hvcC"), "init must carry the hvcC config box");
+        assert!(info.path.exists());
     }
 
     #[test]

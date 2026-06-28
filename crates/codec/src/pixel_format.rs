@@ -524,7 +524,7 @@ fn read_leb128(data: &[u8]) -> Option<(u64, usize)> {
 /// `profile_idc` / `chroma_format_idc` are always populated on a
 /// successful `Some(_)` return since they live in the SPS prefix before
 /// any of the variable-length sections.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct H264SpsInfo {
     pub profile_idc: u8,
     /// Packed 8-bit constraint_set_flags (Ch) — constraint_set0..5_flag
@@ -584,7 +584,7 @@ pub struct H264SpsInfo {
 /// Width/height are post-conformance-window (§7.4.3.2.1): per the spec,
 /// output luma dimensions = `pic_width_in_luma_samples - SubWidthC *
 /// (conf_win_left + conf_win_right)` (and analogously for height).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HevcSpsInfo {
     pub sps_video_parameter_set_id: u8,
     pub sps_seq_parameter_set_id: u8,
@@ -631,6 +631,13 @@ pub struct HevcSpsInfo {
     /// `profile_compatibility_flag[32]` — high bit at index 0. Needed
     /// for the Std PTL struct.
     pub profile_compatibility_flags: u32,
+    /// `general_profile_space` (2 bits) — almost always 0. Part of the
+    /// `hvc1.*` codec string prefix.
+    pub general_profile_space: u8,
+    /// `general_constraint_indicator_flags` (48 bits), right-aligned in a u64
+    /// (byte 0 = bits 47..40). Emitted as the trailing `.XX` segments of the
+    /// `hvc1.*` codec string.
+    pub general_constraint_flags: u64,
 }
 
 /// Parsed HEVC VPS — minimum fields needed for StdVideoH265VideoParameterSet.
@@ -2671,15 +2678,17 @@ pub fn parse_hevc_sps(sample: &[u8]) -> Option<HevcSpsInfo> {
     // profile_tier_level: capture general_profile_idc + tier + level
     // for the VPS mirror + Std struct. The rest is skipped via the
     // same helper we already had.
-    let general_profile_space = br.read_bits(2)?;
+    let general_profile_space = br.read_bits(2)? as u8;
     let tier_flag = br.read_bits(1)? == 1;
     let profile_idc = br.read_bits(5)? as u8;
-    let _ = general_profile_space;
-    // general_profile_compatibility_flag[32] — captured for Std PTL.
+    // general_profile_compatibility_flag[32] — captured for Std PTL + codec str.
     let profile_compatibility_flags = br.read_bits(32)?;
-    // constraint flags (48 bits) — ignored here; Std PTL has them as
-    // individual flag bits we're not reporting (conservative default).
-    let _ = br.read_bits(48)?;
+    // general_constraint_indicator_flags (48 bits) — captured for the hvc1.*
+    // codec string's trailing constraint bytes. Read as two halves because
+    // BitReader::read_bits returns a u32.
+    let constraint_hi = br.read_bits(24)? as u64;
+    let constraint_lo = br.read_bits(24)? as u64;
+    let general_constraint_flags = (constraint_hi << 24) | constraint_lo;
     let level_idc = br.read_bits(8)? as u8;
     // Skip sub-layer profile/level blocks — matches
     // skip_hevc_profile_tier_level's tail logic.
@@ -2861,6 +2870,8 @@ pub fn parse_hevc_sps(sample: &[u8]) -> Option<HevcSpsInfo> {
         max_num_reorder_pics,
         max_latency_increase_plus1,
         profile_compatibility_flags,
+        general_profile_space,
+        general_constraint_flags,
     })
 }
 

@@ -6,9 +6,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use codec::codec_strings::av1_codec_string;
+use codec::codec_strings::{av1_codec_string, avc_codec_string, hevc_codec_string};
 use codec::encode::EncodedPacket;
-use codec::pixel_format::parse_av1_sequence_header;
+use codec::pixel_format::{H264SpsInfo, HevcSpsInfo, parse_av1_sequence_header};
 use container::cmaf::{CmafAudioMuxer, CmafTrackManifest, CmafVideoMuxer, SegmentInfo};
 
 /// Keyframe interval (frames) for a target segment length at a frame rate.
@@ -163,18 +163,77 @@ pub fn measure_bandwidth(manifest: &CmafTrackManifest) -> (u32, u32) {
     (avg_bps, peak_bps.max(avg_bps))
 }
 
-/// Parse the AV1 codec string (`av01.…`) from a rendition's init segment.
-pub fn av1_codec_string_from_init(init_path: &Path) -> Result<String> {
+/// Parse the HLS `CODECS=` string for a rendition from its init segment,
+/// dispatching on the visual sample entry: `av01` → AV1 sequence header,
+/// `avc1`/`avc3` → `avcC` profile/level, `hvc1`/`hev1` → `hvcC` profile-tier-level.
+pub fn codec_string_from_init(init_path: &Path) -> Result<String> {
     let bytes = std::fs::read(init_path)
         .with_context(|| format!("reading init segment {}", init_path.display()))?;
-    let obus = find_av1c_config_obus(&bytes)
-        .ok_or_else(|| anyhow!("av1C box not found in init segment"))?;
-    let seq = parse_av1_sequence_header(obus)
-        .ok_or_else(|| anyhow!("could not parse AV1 sequence header from av1C"))?;
-    Ok(av1_codec_string(&seq))
+    let entries =
+        stsd_sample_entries(&bytes).ok_or_else(|| anyhow!("stsd entries not found in init"))?;
+    if entries.len() < 8 {
+        bail!("init segment sample entry truncated");
+    }
+    let fourcc: [u8; 4] = entries[4..8].try_into().unwrap();
+    let entry = find_box(entries, &fourcc).ok_or_else(|| anyhow!("sample entry box not found"))?;
+    // Visual sample entry: 8-byte box header + 78-byte VisualSampleEntry header,
+    // then the codec config box (av1C / avcC / hvcC).
+    let children = entry.get(8 + 78..).unwrap_or(&[]);
+    let fcc_str = std::str::from_utf8(&fourcc).unwrap_or("");
+    match &fourcc {
+        b"av01" => {
+            let av1c = find_box(children, b"av1C").ok_or_else(|| anyhow!("av1C box missing"))?;
+            let obus = av1c.get(8 + 4..).ok_or_else(|| anyhow!("av1C truncated"))?;
+            let seq = parse_av1_sequence_header(obus)
+                .ok_or_else(|| anyhow!("could not parse AV1 sequence header from av1C"))?;
+            Ok(av1_codec_string(&seq))
+        }
+        b"avc1" | b"avc3" => {
+            let avcc = find_box(children, b"avcC").ok_or_else(|| anyhow!("avcC box missing"))?;
+            // avcC body: [0]=version [1]=profile_idc [2]=constraint [3]=level_idc.
+            let body = avcc.get(8..).ok_or_else(|| anyhow!("avcC truncated"))?;
+            if body.len() < 4 {
+                bail!("avcC profile/level truncated");
+            }
+            let sps = H264SpsInfo {
+                profile_idc: body[1],
+                constraint_set_flags: body[2],
+                level_idc: body[3],
+                ..Default::default()
+            };
+            Ok(avc_codec_string(fcc_str, &sps))
+        }
+        b"hvc1" | b"hev1" => {
+            let hvcc = find_box(children, b"hvcC").ok_or_else(|| anyhow!("hvcC box missing"))?;
+            // hvcC body: [0]=version [1]=space|tier|profile_idc [2..6]=compat
+            // [6..12]=constraint flags [12]=level_idc.
+            let body = hvcc.get(8..).ok_or_else(|| anyhow!("hvcC truncated"))?;
+            if body.len() < 13 {
+                bail!("hvcC profile-tier-level truncated");
+            }
+            let b1 = body[1];
+            let constraint = ((body[6] as u64) << 40)
+                | ((body[7] as u64) << 32)
+                | ((body[8] as u64) << 24)
+                | ((body[9] as u64) << 16)
+                | ((body[10] as u64) << 8)
+                | (body[11] as u64);
+            let sps = HevcSpsInfo {
+                general_profile_space: b1 >> 6,
+                tier_flag: (b1 >> 5) & 1 == 1,
+                profile_idc: b1 & 0x1F,
+                profile_compatibility_flags: u32::from_be_bytes([body[2], body[3], body[4], body[5]]),
+                general_constraint_flags: constraint,
+                level_idc: body[12],
+                ..Default::default()
+            };
+            Ok(hevc_codec_string(fcc_str, &sps))
+        }
+        other => bail!("unsupported video sample entry fourcc {other:?} in init segment"),
+    }
 }
 
-fn find_av1c_config_obus(buf: &[u8]) -> Option<&[u8]> {
+fn stsd_sample_entries(buf: &[u8]) -> Option<&[u8]> {
     let moov = find_box(buf, b"moov")?;
     let trak = find_child_box(moov, b"trak")?;
     let mdia = find_child_box(trak, b"mdia")?;
@@ -184,17 +243,8 @@ fn find_av1c_config_obus(buf: &[u8]) -> Option<&[u8]> {
     if stsd.len() < 16 {
         return None;
     }
-    let after_header_and_count = &stsd[8 + 8..];
-    let av01 = find_box(after_header_and_count, b"av01")?;
-    if av01.len() < 8 + 78 {
-        return None;
-    }
-    let av01_children = &av01[8 + 78..];
-    let av1c = find_box(av01_children, b"av1C")?;
-    if av1c.len() < 8 + 4 {
-        return None;
-    }
-    Some(&av1c[8 + 4..])
+    // Skip the stsd 8-byte box header + 4-byte version/flags + 4-byte entry_count.
+    Some(&stsd[16..])
 }
 
 fn find_child_box<'a>(parent: &'a [u8], box_type: &[u8; 4]) -> Option<&'a [u8]> {

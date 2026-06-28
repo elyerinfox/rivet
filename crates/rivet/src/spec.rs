@@ -572,14 +572,9 @@ impl OutputSpec {
                 );
             }
         }
-        // H.264 / H.265 are single-file MP4 only today (HLS/CMAF + the
-        // multi-GPU AV1-segment codec invariant are AV1-specific).
-        if self.video_codec != VideoCodec::Av1 && !matches!(self.mode, OutputMode::SingleFile) {
-            bail!(
-                "video codec {:?} is single-file MP4 only; HLS/CMAF output is AV1-only",
-                self.video_codec
-            );
-        }
+        // AV1, H.264, and H.265 are all valid for SingleFile MP4 and for
+        // HLS/CMAF (the CMAF muxer builds av01 / avc3 / hev1 init segments and
+        // the codec invariant handles all three across the multi-GPU path).
         // Container/muxer/mode coherence.
         match self.mode {
             OutputMode::SingleFile => {

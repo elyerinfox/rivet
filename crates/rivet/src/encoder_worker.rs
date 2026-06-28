@@ -464,12 +464,13 @@ fn encode_one_segment(
         first_segment_base_decode_time: chunk.segment_idx as u64 * cfg.segment_target_ticks,
         write_init_segment: write_init,
     };
-    let mut muxer = CmafVideoMuxer::new_with_options(
+    let mut muxer = CmafVideoMuxer::new_with_codec_options(
         &cfg.output_dir,
         cfg.width,
         cfg.height,
         cfg.timescale,
         encoder_color_metadata,
+        cfg.codec,
         muxer_options,
     )
     .with_context(|| {
