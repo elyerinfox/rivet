@@ -58,52 +58,42 @@ pub fn split_annexb_nals(data: &[u8]) -> Vec<&[u8]> {
         None => return nals, // no start code → not Annex-B / empty
     };
     loop {
+        // `find_start_code` reports a 4-byte start code at its first `00`, so the
+        // NAL ends exactly at the next start code — legitimate trailing zero
+        // bytes in the slice RBSP (cabac_zero_words, rbsp trailing) are kept.
         let (next_pos, next_len) = match find_start_code(data, cursor) {
             Some(x) => x,
             None => {
-                // last NAL runs to the end (trim trailing zero bytes)
-                let end = trim_trailing_zeros(&data[cursor..n]);
-                if end > 0 {
-                    nals.push(&data[cursor..cursor + end]);
+                if n > cursor {
+                    nals.push(&data[cursor..n]); // last NAL runs to the end
                 }
                 break;
             }
         };
-        let end = trim_trailing_zeros(&data[cursor..next_pos]);
-        if end > 0 {
-            nals.push(&data[cursor..cursor + end]);
+        if next_pos > cursor {
+            nals.push(&data[cursor..next_pos]);
         }
         cursor = next_pos + next_len;
     }
     nals
 }
 
-/// Find the next Annex-B start code at/after `from`; returns (offset, length).
+/// Find the next start-code **prefix** `00 00 01` at/after `from`; returns
+/// (offset, 3). We deliberately match only the 3-byte prefix: a 4-byte start
+/// code `00 00 00 01` is then seen as `[zero_byte] [00 00 01]`, so the leading
+/// `00` stays with the *previous* NAL as a harmless trailing zero (decoders
+/// ignore it) rather than being greedily consumed — which would otherwise eat a
+/// slice's own trailing `0x00` byte and corrupt it.
 fn find_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
     let n = data.len();
     let mut i = from;
     while i + 3 <= n {
-        if data[i] == 0 && data[i + 1] == 0 {
-            if data[i + 2] == 1 {
-                return Some((i, 3));
-            }
-            if i + 4 <= n && data[i + 2] == 0 && data[i + 3] == 1 {
-                return Some((i, 4));
-            }
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            return Some((i, 3));
         }
         i += 1;
     }
     None
-}
-
-/// Trailing-zero trim so a 4-byte start code's leading `00` (which the 3-byte
-/// scan attributes to the previous NAL) isn't kept as NAL payload.
-fn trim_trailing_zeros(s: &[u8]) -> usize {
-    let mut end = s.len();
-    while end > 0 && s[end - 1] == 0 {
-        end -= 1;
-    }
-    end
 }
 
 /// Repackages Annex-B encoder frames into length-prefixed mdat samples while
@@ -186,11 +176,13 @@ mod tests {
         frame.extend(sc4(&idr));
         let mut w = NalSampleWriter::new(NalMuxCodec::H264);
         let sample = w.push_frame(&frame);
-        // captured param sets
-        assert_eq!(w.sps, vec![sps.to_vec()]);
-        assert_eq!(w.pps, vec![pps.to_vec()]);
+        // captured param sets (a 4-byte next start code may add a harmless
+        // trailing 0x00, so check the param set is a prefix of what was captured)
+        assert_eq!(w.sps.len(), 1);
+        assert!(w.sps[0].starts_with(&sps));
+        assert!(w.pps[0].starts_with(&pps));
         assert!(w.has_param_sets());
-        // sample = length-prefixed IDR only
+        // sample = length-prefixed IDR (the last NAL, no trailing start code → exact)
         let mut expect = (idr.len() as u32).to_be_bytes().to_vec();
         expect.extend_from_slice(&idr);
         assert_eq!(sample, expect);
@@ -208,13 +200,35 @@ mod tests {
         frame.extend(sc4(&slice));
         let mut w = NalSampleWriter::new(NalMuxCodec::H265);
         let sample = w.push_frame(&frame);
-        assert_eq!(w.vps, vec![vps.to_vec()]);
-        assert_eq!(w.sps, vec![sps.to_vec()]);
-        assert_eq!(w.pps, vec![pps.to_vec()]);
+        assert!(w.vps[0].starts_with(&vps));
+        assert!(w.sps[0].starts_with(&sps));
+        assert!(w.pps[0].starts_with(&pps));
         assert!(w.has_param_sets());
         let mut expect = (slice.len() as u32).to_be_bytes().to_vec();
         expect.extend_from_slice(&slice);
         assert_eq!(sample, expect);
+    }
+
+    #[test]
+    fn preserves_slice_trailing_zero_bytes() {
+        // A slice NAL whose RBSP legitimately ends in zero bytes (cabac_zero_words)
+        // must NOT be truncated — that corrupts the slice and breaks decode.
+        let slice = [0x65u8, 0x88, 0x00, 0x00, 0x00];
+        let next = [0x41u8, 0x9a]; // a following P-slice
+        let mut frame = sc4(&slice);
+        frame.extend(sc4(&next));
+        let nals = split_annexb_nals(&frame);
+        assert_eq!(nals.len(), 2);
+        // The slice's own bytes (incl. its trailing zeros) are never eaten; a
+        // 4-byte next start code may leave one harmless extra trailing 0x00.
+        assert!(nals[0].starts_with(&slice), "slice trailing zeros must survive: {:?}", nals[0]);
+        assert!(nals[1].starts_with(&next));
+        // 3-byte next start code: the slice is preserved exactly.
+        let mut f2 = sc4(&slice);
+        f2.extend_from_slice(&[0, 0, 1]);
+        f2.extend_from_slice(&next);
+        let n2 = split_annexb_nals(&f2);
+        assert_eq!(n2[0], &slice, "trailing zeros kept exactly with a 3-byte next start code");
     }
 
     #[test]
