@@ -186,17 +186,6 @@ impl Av1Mp4Muxer {
         // sequence header we embed in av1C). H.264/H.265: repackage the
         // Annex-B frame into a length-prefixed mdat sample, capturing the
         // parameter sets for the avcC/hvcC config box.
-        // Debug: dump the raw Annex-B encoder output (concatenated) to inspect
-        // the bitstream independent of the muxer. `RIVET_DUMP_RAW=/path.h264`.
-        if self.nal_writer.is_some() {
-            if let Ok(path) = std::env::var("RIVET_DUMP_RAW") {
-                if let Ok(mut f) =
-                    std::fs::OpenOptions::new().create(true).append(true).open(&path)
-                {
-                    let _ = f.write_all(&packet.data);
-                }
-            }
-        }
         match &mut self.nal_writer {
             None => {
                 // AV1: one OBU sample per packet.
