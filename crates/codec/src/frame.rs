@@ -3,7 +3,7 @@ use bytes::Bytes;
 /// Output video codec for the encoder + muxer. AV1 is the project default
 /// (royalty-clean); H.264 / H.265 are selectable for compatibility with
 /// legacy players (they carry patent-licensing obligations — see the docs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum VideoCodec {
     #[default]
     Av1,

@@ -230,7 +230,7 @@ async fn run_single_file(
     } else {
         (header.info.duration * frame_rate).round().max(0.0) as u64
     };
-    let gpu_pool = multigpu::gpu_pool_for_policy(spec.encode_policy);
+    let gpu_pool = multigpu::gpu_pool_for_policy(spec.encode_policy, spec.video_codec);
     if matches!(
         spec.encode_policy,
         EncodePolicy::AllGpus | EncodePolicy::Family(_)
@@ -239,10 +239,11 @@ async fn run_single_file(
         // `ChunkSeamMode::Serial` forces one encoder (seam-free) even on a
         // multi-GPU host — skip the chunk-and-stitch path entirely.
         && spec.chunk_seam_mode != crate::spec::ChunkSeamMode::Serial
-        // The multi-GPU chunk-and-stitch path's codec invariant parses `av1C`;
-        // H.264/H.265 take the serial single-encoder path below.
-        && spec.video_codec == codec::frame::VideoCodec::Av1
     {
+        // The chunk-and-stitch path's codec invariant now handles av1C / avcC /
+        // hvcC, so AV1, H.264, and H.265 all chunk across GPUs. Each chunk is a
+        // closed GOP (first frame an IDR), so stitched H.264/H.265 streams reset
+        // refs cleanly at every chunk boundary.
         return run_single_file_multigpu(
             input,
             spec,
@@ -356,6 +357,7 @@ async fn run_single_file_multigpu(
         spec.resolve_output(header.info.color_metadata, header.info.pixel_format);
     let params = MultiGpuParams {
         input,
+        codec: spec.video_codec,
         rungs: &spec.rungs,
         header: header.clone(),
         source_color_metadata: header.info.color_metadata,
@@ -402,8 +404,8 @@ fn mux_rung_packets_to_mp4(
     color_metadata: ColorMetadata,
     audio: Option<&PreparedAudio>,
 ) -> Result<RungOutput> {
-    let mut muxer =
-        Av1Mp4Muxer::new(rp.width, rp.height, frame_rate).context("Av1Mp4Muxer::new")?;
+    let mut muxer = Av1Mp4Muxer::new_with_codec(rp.width, rp.height, frame_rate, rp.codec)
+        .context("Av1Mp4Muxer::new_with_codec")?;
     muxer.set_color_metadata(color_metadata);
     if let Some(a) = audio {
         if let Err(e) = muxer.with_audio(a.info.clone()) {
@@ -531,11 +533,12 @@ async fn run_hls(
         (header.info.duration * frame_rate).round().max(0.0) as u64
     };
 
-    let gpu_pool = multigpu::gpu_pool_for_policy(spec.encode_policy);
+    let gpu_pool = multigpu::gpu_pool_for_policy(spec.encode_policy, spec.video_codec);
     let (output_color_metadata, output_pixel_format) =
         spec.resolve_output(header.info.color_metadata, header.info.pixel_format);
     let params = MultiGpuParams {
         input,
+        codec: spec.video_codec,
         rungs: &spec.rungs,
         header: header.clone(),
         source_color_metadata: header.info.color_metadata,

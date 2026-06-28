@@ -484,15 +484,22 @@ pub fn select_encoder(
 ///
 /// The probe constructs + immediately drops a real encoder, so the verdict is
 /// cached per GPU index (queried once per process).
-pub fn av1_encode_capable(dev: &gpu::GpuDevice) -> bool {
+/// Whether `dev` can encode `codec` in hardware — probed by actually building
+/// the encoder the worker would use (vendor-pinned to this GPU) and seeing if
+/// init succeeds. Cached per `(gpu_index, codec)` since a GPU may encode H.264
+/// but not AV1 (e.g. NVIDIA Ampere consumer: H.264/H.265 yes, AV1 no). A GPU
+/// that fails is dropped from the *encode* pool for that codec but stays usable
+/// for decode.
+pub fn encode_capable(dev: &gpu::GpuDevice, codec: VideoCodec) -> bool {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<u32, bool>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<(u32, VideoCodec), bool>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(&cached) = cache.lock().unwrap().get(&dev.index) {
+    let key = (dev.index, codec);
+    if let Some(&cached) = cache.lock().unwrap().get(&key) {
         return cached;
     }
-    // A representative, widely-accepted probe size; AV1 codec support does not
+    // A representative, widely-accepted probe size; codec support does not
     // depend on resolution, so any valid dims answer the capability question.
     let probe = EncoderConfig {
         width: 640,
@@ -500,6 +507,7 @@ pub fn av1_encode_capable(dev: &gpu::GpuDevice) -> bool {
         frame_rate: 30.0,
         gpu_index: Some(dev.index),
         gpu_vendor: Some(dev.vendor),
+        codec,
         ..Default::default()
     };
     let capable = match select_encoder(probe, None) {
@@ -509,14 +517,20 @@ pub fn av1_encode_capable(dev: &gpu::GpuDevice) -> bool {
                 gpu_index = dev.index,
                 gpu = %dev.name,
                 vendor = ?dev.vendor,
+                ?codec,
                 error = %e,
-                "GPU cannot encode AV1 — excluding it from the encode pool (still usable for decode)"
+                "GPU cannot encode this codec — excluding it from the encode pool (still usable for decode)"
             );
             false
         }
     };
-    cache.lock().unwrap().insert(dev.index, capable);
+    cache.lock().unwrap().insert(key, capable);
     capable
+}
+
+/// Back-compat shim: AV1 encode capability (the inventory's "AV1" column).
+pub fn av1_encode_capable(dev: &gpu::GpuDevice) -> bool {
+    encode_capable(dev, VideoCodec::Av1)
 }
 
 fn create_backend(

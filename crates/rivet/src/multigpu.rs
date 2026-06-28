@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use codec::encode::AUTO_FROM_TARGET;
-use codec::frame::{ColorMetadata, PixelFormat};
+use codec::frame::{ColorMetadata, PixelFormat, VideoCodec};
 use container::cmaf::CmafTrackManifest;
 use container::streaming::DemuxHeader;
 use tokio::sync::{Notify, mpsc};
@@ -73,6 +73,9 @@ pub struct RungManifest {
 /// Inputs to [`run_multigpu_hls`].
 pub struct MultiGpuParams<'a> {
     pub input: Bytes,
+    /// Output video codec — drives the per-worker encoder dispatch, the codec
+    /// invariant parse, and the stitch muxer's sample-entry choice.
+    pub codec: VideoCodec,
     pub rungs: &'a [Rung],
     pub header: DemuxHeader,
     pub source_color_metadata: ColorMetadata,
@@ -377,6 +380,7 @@ pub async fn run_multigpu_hls(
     // Initial encoder workers (one per rung, smallest first).
     let mut worker_tasks: JoinSet<(usize, Result<()>)> = JoinSet::new();
     let ctx = WorkerCtx {
+        codec: params.codec,
         frame_rate: params.frame_rate,
         output_color_metadata: params.output_color_metadata,
         output_pixel_format: params.output_pixel_format,
@@ -526,6 +530,7 @@ pub async fn run_multigpu_hls(
 /// Per-job constants shared by every encoder worker.
 #[derive(Clone)]
 struct WorkerCtx {
+    codec: VideoCodec,
     frame_rate: f64,
     output_color_metadata: ColorMetadata,
     output_pixel_format: PixelFormat,
@@ -558,6 +563,7 @@ fn spawn_encoder_worker(
 
     let cfg = EncoderWorkerConfig {
         rung_idx,
+        codec: ctx.codec,
         width: rung.width,
         height: rung.height,
         frame_rate: ctx.frame_rate,
@@ -728,17 +734,18 @@ fn select_gpus_for_policy(policy: EncodePolicy) -> Vec<codec::gpu::GpuDevice> {
 /// (e.g. a pinned index or vendor family that isn't present) yields capacity 0,
 /// so the orchestrator's pre-flight probe / lease claim surfaces a clear error.
 ///
-/// When more than one GPU is selected, cards that can't actually encode AV1
-/// (e.g. a pre-Ada NVIDIA that decodes via NVDEC but has no AV1 encode silicon)
-/// are dropped from the **encode** pool — so a worker never leases an incapable
-/// card and hard-fails the run; the capable cards (e.g. the Arc) do the encoding.
-/// A single selected GPU is left as-is, since the serial path's non-pinned
-/// encoder dispatch already falls through vendors. Dropped cards stay available
-/// for the decode pump ([`policy_gpu_indices`] is intentionally NOT filtered).
-pub fn gpu_pool_for_policy(policy: EncodePolicy) -> Arc<GpuPool> {
+/// When more than one GPU is selected, cards that can't actually encode the
+/// REQUESTED `codec` (e.g. a pre-Ada NVIDIA that decodes via NVDEC but has no
+/// AV1 encode silicon — yet can still encode H.264/H.265) are dropped from the
+/// **encode** pool, so a worker never leases an incapable card and hard-fails
+/// the run; the capable cards do the encoding. A single selected GPU is left
+/// as-is, since the serial path's non-pinned encoder dispatch already falls
+/// through vendors. Dropped cards stay available for the decode pump
+/// ([`policy_gpu_indices`] is intentionally NOT filtered).
+pub fn gpu_pool_for_policy(policy: EncodePolicy, codec: codec::frame::VideoCodec) -> Arc<GpuPool> {
     let selected = select_gpus_for_policy(policy);
     let pool_gpus = if selected.len() > 1 {
-        selected.into_iter().filter(|g| codec::encode::av1_encode_capable(g)).collect()
+        selected.into_iter().filter(|g| codec::encode::encode_capable(g, codec)).collect()
     } else {
         selected
     };
@@ -772,6 +779,7 @@ pub fn serial_gpu_for_policy(policy: EncodePolicy) -> Option<u32> {
 #[derive(Debug)]
 pub struct RungPackets {
     pub rung_index: usize,
+    pub codec: VideoCodec,
     pub width: u32,
     pub height: u32,
     pub label: String,
@@ -853,6 +861,7 @@ pub async fn run_multigpu_single_file(
 
     // Finalizers: stitch each rung's chunks (sorted, deduped) into one stream.
     let total_input_frames = params.total_input_frames;
+    let codec = params.codec; // Copy; captured by each finalizer closure
     let (finalizer_tx, mut finalizer_rx) =
         mpsc::channel::<(usize, Result<Option<RungPackets>>)>(n.max(1));
     let mut finalizer_handles = Vec::with_capacity(n);
@@ -913,6 +922,7 @@ pub async fn run_multigpu_single_file(
                 );
                 Ok(Some(RungPackets {
                     rung_index: idx,
+                    codec,
                     width: rung.width,
                     height: rung.height,
                     label: rung.label.clone(),
@@ -1014,6 +1024,7 @@ pub async fn run_multigpu_single_file(
     // Initial chunk workers.
     let mut worker_tasks: JoinSet<(usize, Result<()>)> = JoinSet::new();
     let ctx = WorkerCtx {
+        codec: params.codec,
         frame_rate: params.frame_rate,
         output_color_metadata: params.output_color_metadata,
         output_pixel_format: params.output_pixel_format,
@@ -1174,6 +1185,7 @@ fn spawn_chunk_worker(
     let gpu_vendor = lease.vendor;
     let cfg = EncoderWorkerConfig {
         rung_idx,
+        codec: ctx.codec,
         width: rung.width,
         height: rung.height,
         frame_rate: ctx.frame_rate,

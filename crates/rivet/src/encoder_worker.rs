@@ -20,8 +20,11 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use codec::encode::{self, EncoderConfig};
-use codec::frame::{ColorMetadata, PixelFormat};
-use codec::pixel_format::{Av1SequenceHeader, parse_av1_sequence_header};
+use codec::frame::{ColorMetadata, PixelFormat, VideoCodec};
+use codec::pixel_format::{
+    Av1SequenceHeader, H264SpsInfo, HevcSpsInfo, parse_av1_sequence_header, parse_h264_sps,
+    parse_hevc_sps,
+};
 use container::cmaf::{CmafVideoMuxer, CmafVideoMuxerOptions, SegmentInfo};
 use tokio::sync::mpsc;
 
@@ -47,8 +50,83 @@ use crate::frame_queue::{SegmentChunk, SegmentChunkQueue};
 /// First worker on a rung SETS the invariant. Subsequent workers
 /// (helpers from any vendor) COMPARE; mismatch fails the run loudly
 /// instead of silently corrupting output.
+/// Per-rung codec invariant. Each chunk encoded on a different GPU must agree on
+/// these decode-init fields, or strict players reject the stitched stream. AV1
+/// compares sequence-header fields; H.264/H.265 compare the SPS profile / level
+/// / chroma / bit-depth / dims (the `avcC`/`hvcC` decode-init contract).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RungCodecInvariant {
+pub enum RungCodecInvariant {
+    Av1(Av1Invariant),
+    /// Shared by H.264 + H.265 — a rung is single-codec, so the variant only
+    /// ever compares chunks of the same codec.
+    H26x(H26xInvariant),
+}
+
+impl RungCodecInvariant {
+    /// Human-readable diff for error messages. Empty when the two agree.
+    fn describe_diff(&self, other: &Self) -> String {
+        if self == other {
+            return String::new();
+        }
+        match (self, other) {
+            (RungCodecInvariant::Av1(a), RungCodecInvariant::Av1(b)) => a.describe_diff(b),
+            _ => format!("rung={self:?}, this worker={other:?}"),
+        }
+    }
+}
+
+/// H.264 / H.265 decode-init invariant, derived from the SPS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H26xInvariant {
+    pub profile_idc: u8,
+    pub level_idc: u8,
+    pub chroma_format_idc: u8,
+    pub bit_depth_luma: u8,
+    pub bit_depth_chroma: u8,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl H26xInvariant {
+    fn from_h264(sps: &H264SpsInfo) -> Self {
+        Self {
+            profile_idc: sps.profile_idc,
+            level_idc: sps.level_idc,
+            chroma_format_idc: sps.chroma_format_idc,
+            bit_depth_luma: sps.bit_depth_luma,
+            bit_depth_chroma: sps.bit_depth_chroma,
+            width: sps.width.unwrap_or(0),
+            height: sps.height.unwrap_or(0),
+        }
+    }
+
+    fn from_h265(sps: &HevcSpsInfo) -> Self {
+        Self {
+            profile_idc: sps.profile_idc,
+            level_idc: sps.level_idc,
+            chroma_format_idc: sps.chroma_format_idc,
+            bit_depth_luma: sps.bit_depth_luma,
+            bit_depth_chroma: sps.bit_depth_chroma,
+            width: sps.width.unwrap_or(0),
+            height: sps.height.unwrap_or(0),
+        }
+    }
+}
+
+/// AV1 sequence-header invariant — every encoder contributing segments to a
+/// single rendition MUST agree on these fields.
+///
+/// Why these specific fields: each is part of the codec-init contract that the
+/// player sets up once from `av1C` and expects to hold for every segment. The
+/// decoder re-parses the inline OBU sequence header in each segment's IDR; if
+/// its parsed values disagree with the av1C from `init.mp4`, strict decoders
+/// (dav1d in conformance mode, Safari AVFoundation, hls.js+libdav1d) reject the
+/// segment. Optional fields (timing info, decoder model, film grain present,
+/// operating points) are tolerated by every major player; we deliberately don't
+/// check them so NVENC + QSV + AMF + rav1e co-exist on one rendition without
+/// cosmetic byte differences triggering false rejections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Av1Invariant {
     pub seq_profile: u8,
     pub seq_level_idx_0: u8,
     pub seq_tier_0: u8,
@@ -65,7 +143,7 @@ pub struct RungCodecInvariant {
     pub still_picture: bool,
 }
 
-impl RungCodecInvariant {
+impl Av1Invariant {
     pub fn from_sequence_header(sh: &Av1SequenceHeader) -> Self {
         Self {
             seq_profile: sh.seq_profile,
@@ -148,16 +226,46 @@ pub fn validate_or_set_rung_invariant(
     gpu_vendor: Option<codec::gpu::GpuVendor>,
     slot: &RwLock<Option<RungCodecInvariant>>,
     first_packet: &[u8],
+    codec: VideoCodec,
 ) -> Result<InvariantCheck> {
-    let parsed = parse_av1_sequence_header(first_packet).ok_or_else(|| {
-        anyhow!(
-            "rung {} (vendor {:?}): could not parse AV1 sequence header from first encoded packet; \
-             encoder did not emit OBU_SEQUENCE_HEADER as required for CMAF segment alignment",
-            rung_idx,
-            gpu_vendor,
-        )
-    })?;
-    let observed = RungCodecInvariant::from_sequence_header(&parsed);
+    // Derive the codec invariant from the worker's first encoded packet: AV1
+    // from the OBU sequence header, H.264/H.265 from the SPS in the Annex-B AU.
+    let observed = match codec {
+        VideoCodec::Av1 => {
+            let parsed = parse_av1_sequence_header(first_packet).ok_or_else(|| {
+                anyhow!(
+                    "rung {} (vendor {:?}): could not parse AV1 sequence header from first \
+                     encoded packet; encoder did not emit OBU_SEQUENCE_HEADER as required for \
+                     segment alignment",
+                    rung_idx,
+                    gpu_vendor,
+                )
+            })?;
+            RungCodecInvariant::Av1(Av1Invariant::from_sequence_header(&parsed))
+        }
+        VideoCodec::H264 => {
+            let sps = parse_h264_sps(first_packet).ok_or_else(|| {
+                anyhow!(
+                    "rung {} (vendor {:?}): could not parse H.264 SPS from first encoded packet; \
+                     encoder did not emit an SPS NAL on the first IDR",
+                    rung_idx,
+                    gpu_vendor,
+                )
+            })?;
+            RungCodecInvariant::H26x(H26xInvariant::from_h264(&sps))
+        }
+        VideoCodec::H265 => {
+            let sps = parse_hevc_sps(first_packet).ok_or_else(|| {
+                anyhow!(
+                    "rung {} (vendor {:?}): could not parse H.265 SPS from first encoded packet; \
+                     encoder did not emit an SPS NAL on the first IRAP",
+                    rung_idx,
+                    gpu_vendor,
+                )
+            })?;
+            RungCodecInvariant::H26x(H26xInvariant::from_h265(&sps))
+        }
+    };
 
     // Fast path: read lock, check if set + matches.
     if let Some(existing) = &*slot.read().unwrap() {
@@ -180,9 +288,8 @@ pub fn validate_or_set_rung_invariant(
             tracing::info!(
                 rung_idx,
                 gpu_vendor = ?gpu_vendor,
-                seq_profile = observed.seq_profile,
-                seq_level_idx_0 = observed.seq_level_idx_0,
-                bit_depth = observed.bit_depth,
+                ?codec,
+                invariant = ?observed,
                 "rung codec invariant captured from first worker"
             );
             *w = Some(observed);
@@ -194,6 +301,9 @@ pub fn validate_or_set_rung_invariant(
 #[derive(Clone)]
 pub struct EncoderWorkerConfig {
     pub rung_idx: usize,
+    /// Output video codec (AV1 / H.264 / H.265) — drives the encoder dispatch
+    /// and the per-rung codec invariant parse.
+    pub codec: VideoCodec,
     pub width: u32,
     pub height: u32,
     pub frame_rate: f64,
@@ -397,6 +507,7 @@ fn encode_one_segment(
                     cfg.gpu_vendor,
                     &cfg.rung_invariant,
                     &packet.data,
+                    cfg.codec,
                 )? {
                     InvariantCheck::Matched | InvariantCheck::SetByThisWorker => {
                         first_packet_decision = Some(true);
@@ -513,6 +624,7 @@ pub struct ChunkPackets {
 /// knobs. Shared by the CMAF and packet workers.
 fn build_enc_config(cfg: &EncoderWorkerConfig) -> EncoderConfig {
     EncoderConfig {
+        codec: cfg.codec,
         width: cfg.width,
         height: cfg.height,
         frame_rate: cfg.frame_rate,
@@ -596,6 +708,7 @@ fn encode_chunk_to_packets(
                     cfg.gpu_vendor,
                     &cfg.rung_invariant,
                     &packet.data,
+                    cfg.codec,
                 )? {
                     InvariantCheck::Matched | InvariantCheck::SetByThisWorker => decided = true,
                     InvariantCheck::Mismatched { diff } => {
@@ -632,6 +745,7 @@ mod tests {
     fn config_clone_preserves_fields() {
         let cfg = EncoderWorkerConfig {
             rung_idx: 2,
+            codec: VideoCodec::Av1,
             width: 1280,
             height: 720,
             frame_rate: 30.0,
@@ -659,7 +773,7 @@ mod tests {
 
     #[test]
     fn invariant_matches_itself() {
-        let a = RungCodecInvariant {
+        let a = RungCodecInvariant::Av1(Av1Invariant {
             seq_profile: 0,
             seq_level_idx_0: 8,
             seq_tier_0: 0,
@@ -674,14 +788,14 @@ mod tests {
             max_frame_width_minus1: 1919,
             max_frame_height_minus1: 1079,
             still_picture: false,
-        };
+        });
         assert_eq!(a.clone(), a);
         assert_eq!(a.describe_diff(&a), "");
     }
 
     #[test]
     fn invariant_diff_lists_changed_fields() {
-        let a = RungCodecInvariant {
+        let inner = Av1Invariant {
             seq_profile: 0,
             seq_level_idx_0: 8,
             seq_tier_0: 0,
@@ -697,9 +811,11 @@ mod tests {
             max_frame_height_minus1: 1079,
             still_picture: false,
         };
-        let mut b = a.clone();
-        b.bit_depth = 10;
-        b.color_primaries = 9;
+        let mut inner_b = inner.clone();
+        inner_b.bit_depth = 10;
+        inner_b.color_primaries = 9;
+        let a = RungCodecInvariant::Av1(inner);
+        let b = RungCodecInvariant::Av1(inner_b);
         let diff = a.describe_diff(&b);
         assert!(diff.contains("bit_depth"));
         assert!(diff.contains("color_primaries"));
@@ -715,9 +831,14 @@ mod tests {
         // soft-fail Mismatched case.
         let slot: RwLock<Option<RungCodecInvariant>> = RwLock::new(None);
         let junk = vec![0u8; 8];
-        let err =
-            validate_or_set_rung_invariant(0, Some(codec::gpu::GpuVendor::Intel), &slot, &junk)
-                .unwrap_err();
+        let err = validate_or_set_rung_invariant(
+            0,
+            Some(codec::gpu::GpuVendor::Intel),
+            &slot,
+            &junk,
+            VideoCodec::Av1,
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("could not parse AV1 sequence header")
@@ -727,7 +848,7 @@ mod tests {
 
     #[test]
     fn mismatched_diff_includes_changed_field() {
-        let existing = RungCodecInvariant {
+        let inner = Av1Invariant {
             seq_profile: 0,
             seq_level_idx_0: 8,
             seq_tier_0: 0,
@@ -743,12 +864,59 @@ mod tests {
             max_frame_height_minus1: 1079,
             still_picture: false,
         };
-        let mut other = existing.clone();
-        other.bit_depth = 10;
+        let mut other_inner = inner.clone();
+        other_inner.bit_depth = 10;
+        let existing = RungCodecInvariant::Av1(inner);
+        let other = RungCodecInvariant::Av1(other_inner);
         let diff = existing.describe_diff(&other);
         assert!(
             diff.contains("bit_depth"),
             "diff should mention bit_depth; got {diff}"
         );
+    }
+
+    #[test]
+    fn h26x_invariant_equality_and_diff() {
+        // Two H.264/H.265 chunks agree iff their SPS-derived fields match.
+        let a = RungCodecInvariant::H26x(H26xInvariant {
+            profile_idc: 100,
+            level_idc: 31,
+            chroma_format_idc: 1,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            width: 1280,
+            height: 720,
+        });
+        assert_eq!(a.clone(), a);
+        assert_eq!(a.describe_diff(&a), "");
+        let b = RungCodecInvariant::H26x(H26xInvariant {
+            profile_idc: 100,
+            level_idc: 31,
+            chroma_format_idc: 1,
+            bit_depth_luma: 10, // a 10-bit chunk must NOT match an 8-bit one
+            bit_depth_chroma: 10,
+            width: 1280,
+            height: 720,
+        });
+        assert_ne!(a, b);
+        assert!(!a.describe_diff(&b).is_empty());
+        // An AV1 invariant never equals an H26x one (defensive — single-codec rungs).
+        let av1 = RungCodecInvariant::Av1(Av1Invariant {
+            seq_profile: 0,
+            seq_level_idx_0: 8,
+            seq_tier_0: 0,
+            bit_depth: 8,
+            monochrome: false,
+            chroma_subsampling_x: true,
+            chroma_subsampling_y: true,
+            color_primaries: 1,
+            transfer_characteristics: 1,
+            matrix_coefficients: 1,
+            color_range: false,
+            max_frame_width_minus1: 1279,
+            max_frame_height_minus1: 719,
+            still_picture: false,
+        });
+        assert_ne!(a, av1);
     }
 }
