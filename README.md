@@ -267,6 +267,10 @@ rivet transcode input.mkv -o hls_dir/ --mode hls --ladder --segment-seconds 4
 # Quality + audio knobs
 rivet transcode input.mkv -o out.mp4 --crf 28 --speed 6 --audio opus
 
+# Splice — trim one input, or concatenate (with per-clip trims) several
+rivet transcode input.mkv -o cut.mp4 --trim-start 2 --trim-end 7
+rivet splice -o out.mp4 a.mp4@0-5 b.mp4@10-20 c.mp4
+
 # Inspect without transcoding
 rivet probe input.mkv [--json]
 

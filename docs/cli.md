@@ -57,6 +57,8 @@ H.265 — pick with `--codec`.
 | `--color <POLICY>` | `sdr` *(default)*, `hdr10`, `hlg`, `passthrough` | Output color / tonemap policy — see [Color & bit depth](#color--bit-depth). |
 | `--pixel-format <FMT>` | `auto` *(default)*, `8bit`, `10bit` | Output luma bit depth. |
 | `--filter <CHAIN>` | e.g. `crop=1280:720,hflip` | Video filter chain applied before scaling — see [Video filters](filters.md). |
+| `--trim-start <S>` | seconds | **Splice/trim:** keep from this time. The output is re-based to zero. Trimmed jobs take the serial encode path. |
+| `--trim-end <S>` | seconds | **Splice/trim:** keep until this time. The kept range is `[start, end)`, exact at any frame rate. To *join* clips, use [`rivet splice`](#rivet-splice). |
 | `--codec <CODEC>` | `av1` *(default)*, `h264`, `h265` | Output video codec. `av1` is royalty-clean (the project default); `h264`/`h265` are for legacy-player compatibility (patent-licensing caveats). All three work for **single-file MP4 and CMAF/HLS**. H.264/H.265 are encoded on **NVENC** (validated on RTX 3090) + **QSV** (validated on Intel Arc); AMF and the `ffmpeg`-wrapper H.264/H.265 paths are a follow-up. |
 
 ### GPU selection
@@ -143,7 +145,59 @@ rivet transcode input.mkv -o out.mp4 --gpu-family nvidia --decode-gpu 0
 
 # HDR10 passthrough (needs a nvidia/amd hardware or ffmpeg build)
 rivet transcode input.mkv -o out.mp4 --color hdr10 --pixel-format 10bit
+
+# Splice/trim: cut a single input to [2s, 7s)
+rivet transcode input.mkv -o cut.mp4 --trim-start 2 --trim-end 7
 ```
+
+---
+
+## `rivet splice`
+
+**Concatenate** (and per-clip **trim**) several inputs into one MP4. Clips are
+joined in order; each is decoded with its own decoder, trimmed to its window,
+and the kept frames are re-encoded into one continuous, zero-based timeline (the
+muxer numbers frames by count, so the join is gap-free with no PTS rewriting).
+Because everything is re-encoded to a uniform output, the inputs **may differ**
+in codec, resolution, or color — output config follows the **first** clip. Audio
+is trimmed per clip and concatenated to match. Single-file output only.
+
+```
+rivet splice -o <OUTPUT> [OPTIONS] <CLIP>...
+```
+
+Each `<CLIP>` is a path, or `PATH@START-END` to trim it (seconds, either side
+optional). `@` is the separator so a Windows drive `C:\…` is unambiguous:
+
+| Clip spec | Meaning |
+|-----------|---------|
+| `a.mp4` | the whole clip |
+| `a.mp4@2-7` | seconds `[2, 7)` |
+| `a.mp4@2-` | from 2 s to the end |
+| `a.mp4@-7` | from the start to 7 s |
+
+| Flag | Values / default | Description |
+|------|------------------|-------------|
+| `-o`, `--output <FILE>` | required | Output MP4. |
+| `--codec <CODEC>` | `av1` *(default)*, `h264`, `h265` | Output video codec (as for `transcode`). |
+| `--crf <N>` | encoder-native | Constant rate factor. |
+| `--audio <POLICY>` | `auto` *(default)*, `opus`, `drop` | Audio handling. |
+
+### Examples
+
+```sh
+# Join three clips end-to-end
+rivet splice -o out.mp4 intro.mp4 body.mkv outro.mov
+
+# Join with per-clip trims (first 5 s of A, then 10–20 s of B, then all of C)
+rivet splice -o out.mp4 a.mp4@0-5 b.mp4@10-20 c.mp4 --codec h265
+
+# A single trimmed clip is just a trim (same as transcode --trim-*)
+rivet splice -o cut.mp4 a.mp4@2-7
+```
+
+> The library equivalents are `rivet::run_splice_job(Vec<Clip>, &spec, …)` and
+> `OutputSpec::with_trim(start, end)` for the single-input case.
 
 ---
 
