@@ -1172,7 +1172,7 @@ mod tests {
         assert_eq!(s.mode, Some(crate::settings::Mode::Hls));
         assert_eq!(s.rungs, vec![(1280, 720), (640, 360)]);
         assert_eq!(s.crf, Some(30));
-        assert_eq!(s.audio, Some(crate::spec::AudioPolicy::ForceOpus));
+        assert_eq!(s.audio, Some(crate::spec::AudioCodecPolicy::ForceOpus));
     }
 
     #[test]

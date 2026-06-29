@@ -258,7 +258,7 @@ Handled per source codec, interleaved into the output container:
 - **Transcode to Opus**: MP3, Vorbis (royalty-clean, Apple-playable in MP4).
 - **Drop** (video-only, with a warn): everything else.
 
-`AudioPolicy::ForceOpus` always produces Opus; `Drop` removes audio.
+`AudioCodecPolicy::ForceOpus` always produces Opus; `Drop` removes audio.
 
 ## 8. Progress & the job engine
 

@@ -30,7 +30,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 use rivet::progress::{RungProgress, RungStatus};
-use rivet::spec::{AudioPolicy, BitDepth, ChunkSeamMode, ColorPolicy, GpuFamily};
+use rivet::spec::{AudioCodecPolicy, BitDepth, ChunkSeamMode, ColorPolicy, GpuFamily};
 use rivet::{JobOutput, RungArtifact, TranscodeSettings};
 
 #[derive(Parser)]
@@ -63,12 +63,12 @@ enum AudioArg {
     Drop,
 }
 
-impl From<AudioArg> for AudioPolicy {
+impl From<AudioArg> for AudioCodecPolicy {
     fn from(a: AudioArg) -> Self {
         match a {
-            AudioArg::Auto => AudioPolicy::Auto,
-            AudioArg::Opus => AudioPolicy::ForceOpus,
-            AudioArg::Drop => AudioPolicy::Drop,
+            AudioArg::Auto => AudioCodecPolicy::Auto,
+            AudioArg::Opus => AudioCodecPolicy::ForceOpus,
+            AudioArg::Drop => AudioCodecPolicy::Drop,
         }
     }
 }

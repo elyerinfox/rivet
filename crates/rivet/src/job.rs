@@ -37,7 +37,7 @@ use crate::cmaf_util::{self, add_audio_sample_with_segment_flush, keyframe_inter
 use crate::decode_pump::{DecodePumpConfig, run_shared_decode_pump_blocking};
 use crate::multigpu::{self, MultiGpuParams, RungManifest, RungPackets};
 use crate::progress::{JobEvent, ProgressSink, RungProgress, RungStatus};
-use crate::spec::{AudioPolicy, EncodePolicy, OutputMode, OutputSpec, Rung};
+use crate::spec::{AudioCodecPolicy, EncodePolicy, OutputMode, OutputSpec, Rung};
 use crate::validate::needs_chroma_downsample;
 
 /// Bounded per-rung frame channel — backpressures the decode pump.
@@ -230,7 +230,7 @@ async fn run_single_file(
     } else {
         (header.info.duration * frame_rate).round().max(0.0) as u64
     };
-    let gpu_pool = multigpu::gpu_pool_for_policy(spec.encode_policy, spec.video_codec);
+    let gpu_pool = multigpu::gpu_pool_for_policy(spec.encode_policy, spec.video_codec.codec());
     if matches!(
         spec.encode_policy,
         EncodePolicy::AllGpus | EncodePolicy::Family(_)
@@ -271,7 +271,7 @@ async fn run_single_file(
         pixel_format: output_pixel_format,
         color_metadata: output_color_metadata,
         gpu_index: encode_gpu,
-        codec: spec.video_codec,
+        codec: spec.video_codec.codec(),
         ..EncoderConfig::default()
     };
     let pump_cfg = DecodePumpConfig {
@@ -357,7 +357,7 @@ async fn run_single_file_multigpu(
         spec.resolve_output(header.info.color_metadata, header.info.pixel_format);
     let params = MultiGpuParams {
         input,
-        codec: spec.video_codec,
+        codec: spec.video_codec.codec(),
         rungs: &spec.rungs,
         header: header.clone(),
         source_color_metadata: header.info.color_metadata,
@@ -536,12 +536,12 @@ async fn run_hls(
         (header.info.duration * frame_rate).round().max(0.0) as u64
     };
 
-    let gpu_pool = multigpu::gpu_pool_for_policy(spec.encode_policy, spec.video_codec);
+    let gpu_pool = multigpu::gpu_pool_for_policy(spec.encode_policy, spec.video_codec.codec());
     let (output_color_metadata, output_pixel_format) =
         spec.resolve_output(header.info.color_metadata, header.info.pixel_format);
     let params = MultiGpuParams {
         input,
-        codec: spec.video_codec,
+        codec: spec.video_codec.codec(),
         rungs: &spec.rungs,
         header: header.clone(),
         source_color_metadata: header.info.color_metadata,
@@ -649,16 +649,16 @@ impl PreparedAudio {
     }
 }
 
-fn prepare_audio(track: Option<&AudioTrack>, policy: AudioPolicy) -> Result<Option<PreparedAudio>> {
+fn prepare_audio(track: Option<&AudioTrack>, policy: AudioCodecPolicy) -> Result<Option<PreparedAudio>> {
     let Some(track) = track else {
         return Ok(None);
     };
-    if policy == AudioPolicy::Drop {
+    if policy == AudioCodecPolicy::Drop {
         return Ok(None);
     }
     let codec = track.codec.to_ascii_lowercase();
     let passthrough_ok = matches!(codec.as_str(), "aac" | "opus" | "ac3" | "eac3");
-    let force_opus = policy == AudioPolicy::ForceOpus;
+    let force_opus = policy == AudioCodecPolicy::ForceOpus;
 
     if passthrough_ok && !(force_opus && codec != "opus") {
         let info = passthrough_info(&codec, track);

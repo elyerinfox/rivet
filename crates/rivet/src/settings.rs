@@ -9,7 +9,7 @@
 use anyhow::{Context, Result, bail};
 
 use crate::spec::{
-    AudioPolicy, BitDepth, ChunkSeamMode, ColorPolicy, EncodePolicy, GpuFamily, OutputSpec, Quality,
+    AudioCodecPolicy, BitDepth, ChunkSeamMode, ColorPolicy, EncodePolicy, GpuFamily, OutputSpec, Quality,
     Rung,
 };
 
@@ -33,7 +33,7 @@ pub struct TranscodeSettings {
     pub segment_seconds: Option<f32>,
     pub crf: Option<u8>,
     pub speed: Option<u8>,
-    pub audio: Option<AudioPolicy>,
+    pub audio: Option<AudioCodecPolicy>,
     pub color: Option<ColorPolicy>,
     pub bit_depth: Option<BitDepth>,
     pub seam: Option<ChunkSeamMode>,
@@ -55,7 +55,7 @@ pub struct TranscodeSettings {
     /// `codec::filter::parse_chain` at the edge.
     pub filters: Vec<codec::filter::VideoFilter>,
     /// Output video codec: `av1` (default), `h264`, or `h265`. `None` = av1.
-    pub video_codec: Option<codec::frame::VideoCodec>,
+    pub video_codec: Option<crate::spec::VideoCodecPolicy>,
 }
 
 impl TranscodeSettings {
@@ -212,11 +212,11 @@ pub fn parse_mode(s: &str) -> Result<Mode> {
     }
 }
 
-pub fn parse_audio(s: &str) -> Result<AudioPolicy> {
+pub fn parse_audio(s: &str) -> Result<AudioCodecPolicy> {
     match s {
-        "auto" => Ok(AudioPolicy::Auto),
-        "opus" => Ok(AudioPolicy::ForceOpus),
-        "drop" => Ok(AudioPolicy::Drop),
+        "auto" => Ok(AudioCodecPolicy::Auto),
+        "opus" => Ok(AudioCodecPolicy::ForceOpus),
+        "drop" => Ok(AudioCodecPolicy::Drop),
         o => bail!("audio must be auto|opus|drop, got '{o}'"),
     }
 }
@@ -249,12 +249,12 @@ pub fn parse_seam(s: &str) -> Result<ChunkSeamMode> {
     }
 }
 
-pub fn parse_video_codec(s: &str) -> Result<codec::frame::VideoCodec> {
-    use codec::frame::VideoCodec;
+pub fn parse_video_codec(s: &str) -> Result<crate::spec::VideoCodecPolicy> {
+    use crate::spec::VideoCodecPolicy;
     match s.to_ascii_lowercase().as_str() {
-        "av1" | "av01" => Ok(VideoCodec::Av1),
-        "h264" | "avc" | "avc1" | "x264" => Ok(VideoCodec::H264),
-        "h265" | "hevc" | "hvc1" | "x265" => Ok(VideoCodec::H265),
+        "av1" | "av01" => Ok(VideoCodecPolicy::Av1),
+        "h264" | "avc" | "avc1" | "x264" => Ok(VideoCodecPolicy::H264),
+        "h265" | "hevc" | "hvc1" | "x265" => Ok(VideoCodecPolicy::H265),
         o => bail!("codec must be av1|h264|h265, got '{o}'"),
     }
 }
@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(s.mode, Some(Mode::Hls));
         assert_eq!(s.rungs, vec![(1280, 720), (640, 360)]);
         assert_eq!(s.crf, Some(30));
-        assert_eq!(s.audio, Some(AudioPolicy::ForceOpus));
+        assert_eq!(s.audio, Some(AudioCodecPolicy::ForceOpus));
         assert_eq!(s.gpu, Some(1));
         assert_eq!(s.max_fps, Some(30.0));
     }

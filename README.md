@@ -103,8 +103,8 @@ A job is described by an [`OutputSpec`](crates/rivet/src/spec.rs):
 | Dimension       | Type                         | Choices |
 |-----------------|------------------------------|---------|
 | **Output mode** | `OutputMode`                 | `SingleFile`, `Hls { segment_seconds }` |
-| **Video codec** | `VideoCodec`                 | `Av1` (default), `H264`, or `H265` — see [Choosing the output codec](#choosing-the-output-codec) |
-| **Audio**       | `AudioPolicy`                | `Auto` (passthrough/transcode), `ForceOpus`, `Drop` |
+| **Video codec** | `VideoCodecPolicy`           | `Av1` (default), `H264`, or `H265` — see [Choosing the output codec](#choosing-the-output-codec) |
+| **Audio**       | `AudioCodecPolicy`           | `Auto` (passthrough/transcode), `ForceOpus`, `Drop` |
 | **Container**   | `Container`                  | `Mp4`, `Cmaf` |
 | **Muxer**       | `Muxer`                      | `Mp4File`, `CmafHls` |
 | **Rungs**       | `Vec<Rung>`                  | each `Rung` = `width × height` + per-rung `Quality` (crf / speed / target / tier / keyframe interval) |
@@ -146,7 +146,7 @@ println!("{}x{} {}", info.width, info.height, info.video_codec);
 
 ```rust
 use std::sync::Arc;
-use rivet::{OutputSpec, Rung, AudioPolicy, run_job_blocking, fn_sink};
+use rivet::{OutputSpec, Rung, AudioCodecPolicy, run_job_blocking, fn_sink};
 use rivet::progress::RungProgress;
 
 let bytes = std::fs::read("input.mkv")?;
@@ -156,7 +156,7 @@ let spec = OutputSpec::hls(
     vec![Rung::new(1920, 1080), Rung::new(1280, 720), Rung::new(640, 360)],
     4.0,
 )
-.with_audio(AudioPolicy::Auto);
+.with_audio(AudioCodecPolicy::Auto);
 
 // Uniform progress callback (status + percent + counters per rung).
 let sink = Arc::new(fn_sink(|p: RungProgress| {
@@ -179,13 +179,13 @@ A fully-specified single-file job, picking the codec quality, frame-rate cap,
 color/tonemap policy, and output bit depth per [the table below](#output-color--bit-depth):
 
 ```rust
-use rivet::{OutputSpec, Rung, Quality, AudioPolicy, PerceptualTarget};
+use rivet::{OutputSpec, Rung, Quality, AudioCodecPolicy, PerceptualTarget};
 
 let spec = OutputSpec::single_file(vec![
     Rung::new(1920, 1080).with_quality(Quality::crf(28)),
     Rung::new(1280, 720).with_quality(Quality::target(PerceptualTarget::Standard)),
 ])
-.with_audio(AudioPolicy::Auto)
+.with_audio(AudioCodecPolicy::Auto)
 .with_max_frame_rate(30.0)   // cap output cadence at 30 fps
 .web_sdr();                  // BT.709 8-bit SDR, tonemapping any HDR source down (default)
 
@@ -380,28 +380,49 @@ integrated GPU while the discrete GPUs encode.
 
 ### Choosing the output codec
 
-The output codec is a first-class, selectable dimension —
-[`VideoCodec`](crates/codec/src/frame.rs) is `Av1` (default), `H264`, or `H265`.
-**AV1** is the recommended target (AV1 + Opus in MP4 = zero royalty exposure);
-**H.264 / H.265** are there for legacy-player compatibility and carry the
-patent-licensing obligations AV1 was chosen to avoid. The encode tier is
-GPU-accelerated (NVENC / AMF / QSV). H.264/H.265 work for single-file MP4 **and**
-CMAF/HLS (the muxer emits `avc1`/`avc3`/`hvc1`/`hev1` sample entries and the
-right `CODECS=` strings); AV1 stays the cross-vendor default.
+The output codec is a first-class, selectable dimension. In Rust you pick it with
+a [`VideoCodecPolicy`](crates/rivet/src/spec.rs) — the video analogue of
+[`AudioCodecPolicy`](crates/rivet/src/spec.rs) — which is `Av1` (default), `H264`,
+or `H265`. **AV1** is the recommended target (AV1 + Opus in MP4 = zero royalty
+exposure); **H.264 / H.265** are there for legacy-player compatibility and carry
+the patent-licensing obligations AV1 was chosen to avoid. The encode tier is
+GPU-accelerated (NVENC / AMF / QSV). All three work for single-file MP4 **and**
+CMAF/HLS (the muxer emits `av01`/`avc1`/`avc3`/`hvc1`/`hev1` sample entries and
+the right `CODECS=` strings); AV1 stays the cross-vendor default.
 
-You pick the codec the same way in every surface — string values `av1` / `h264`
-/ `h265` (aliases `avc`/`hevc` accepted):
+You pick the codec the same way in every surface — codecs are the strings `av1`
+/ `h264` / `h265` (aliases `avc`/`hevc`/`x264`/`x265`/`av01`/… accepted). Omit it
+and you get AV1.
 
-| Surface | How to specify |
-|---------|----------------|
-| **Rust** | `OutputSpec::single_file(…).with_video_codec(VideoCodec::H264)` |
-| **CLI** | `rivet transcode in.mp4 -o out.mp4 --codec h264` |
-| **Settings DSL / IPC header** | `codec=h264` (the `#rivet k=v …` line / `key=value` string) |
-| **Batch manifest** (YAML/JSON) | `codec: h264` on a job or in `defaults:` |
-| **HTTP API** | `?codec=h264` (query) or `"codec": "h264"` (JSON body) |
+```rust
+// Rust — the VideoCodecPolicy, alongside the AudioCodecPolicy
+use rivet::{OutputSpec, Rung, VideoCodecPolicy, AudioCodecPolicy};
 
-Omit it and you get AV1. See [OutputSpec](docs/output-spec.md),
-[CLI](docs/cli.md), [Batch](docs/batch.md), and [HTTP API](docs/api.md).
+let spec = OutputSpec::single_file(vec![Rung::new(1280, 720)])
+    .with_video_codec(VideoCodecPolicy::H265)   // av1 (default) · h264 · h265
+    .with_audio(AudioCodecPolicy::Auto);        // passthrough / transcode-to-Opus / drop
+```
+
+```sh
+# CLI
+rivet transcode in.mp4 -o out.mp4 --codec h265
+
+# Batch manifest (YAML) — `rivet batch jobs.yaml`
+#   defaults: { codec: h264 }
+#   jobs: [ { input: a.mkv, codec: h265 }, { input: b.mp4 } ]   # b → av1
+
+# HTTP API — query param or JSON body
+curl --data-binary @in.mp4 "http://localhost:8080/v1/transcode?mode=hls&codec=h265"
+curl -X POST -H 'content-type: application/json' \
+     -d '{"input":{"path":"in.mp4"},"spec":{"mode":"hls","codec":"h265"}}' \
+     http://localhost:8080/v1/transcode
+
+# Settings DSL / IPC header (the `#rivet k=v …` line) — key=value
+#   #rivet codec=h265 mode=hls
+```
+
+See [OutputSpec](docs/output-spec.md), [CLI](docs/cli.md),
+[Batch](docs/batch.md), and [HTTP API](docs/api.md) for the full field set.
 
 ## Compatibility matrix
 
@@ -543,7 +564,7 @@ supports AV1 plays.
 | MP3    | —           | ✅ |
 | Vorbis | —           | ✅ |
 
-`AudioPolicy::Auto` passes through AAC/Opus/AC-3/E-AC-3, transcodes MP3/Vorbis to
+`AudioCodecPolicy::Auto` passes through AAC/Opus/AC-3/E-AC-3, transcodes MP3/Vorbis to
 Opus, and drops the rest. `ForceOpus` produces Opus from any decodable source;
 `Drop` yields video-only output. (Multichannel ≥3ch transcode is not yet
 supported and is dropped with a warning.)

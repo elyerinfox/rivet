@@ -101,7 +101,7 @@ A job is described by an [`OutputSpec`](crates/rivet/src/spec.rs):
 |-----------------|------------------------------|---------|
 | **Output mode** | `OutputMode`                 | `SingleFile`, `Hls { segment_seconds }` |
 | **Video codec** | `VideoCodec`                 | `Av1` (the only implemented codec — see [note](#a-note-on-the-output-codec)) |
-| **Audio**       | `AudioPolicy`                | `Auto` (passthrough/transcode), `ForceOpus`, `Drop` |
+| **Audio**       | `AudioCodecPolicy`                | `Auto` (passthrough/transcode), `ForceOpus`, `Drop` |
 | **Container**   | `Container`                  | `Mp4`, `Cmaf` |
 | **Muxer**       | `Muxer`                      | `Mp4File`, `CmafHls` |
 | **Rungs**       | `Vec<Rung>`                  | each `Rung` = `width × height` + per-rung `Quality` (crf / speed / target / tier / keyframe interval) |
@@ -143,7 +143,7 @@ println!("{}x{} {}", info.width, info.height, info.video_codec);
 
 ```rust
 use std::sync::Arc;
-use rivet::{OutputSpec, Rung, AudioPolicy, run_job_blocking, fn_sink};
+use rivet::{OutputSpec, Rung, AudioCodecPolicy, run_job_blocking, fn_sink};
 use rivet::progress::RungProgress;
 
 let bytes = std::fs::read("input.mkv")?;
@@ -153,7 +153,7 @@ let spec = OutputSpec::hls(
     vec![Rung::new(1920, 1080), Rung::new(1280, 720), Rung::new(640, 360)],
     4.0,
 )
-.with_audio(AudioPolicy::Auto);
+.with_audio(AudioCodecPolicy::Auto);
 
 // Uniform progress callback (status + percent + counters per rung).
 let sink = Arc::new(fn_sink(|p: RungProgress| {
@@ -176,13 +176,13 @@ A fully-specified single-file job, picking the codec quality, frame-rate cap,
 color/tonemap policy, and output bit depth per [the table below](#output-color--bit-depth):
 
 ```rust
-use rivet::{OutputSpec, Rung, Quality, AudioPolicy, PerceptualTarget};
+use rivet::{OutputSpec, Rung, Quality, AudioCodecPolicy, PerceptualTarget};
 
 let spec = OutputSpec::single_file(vec![
     Rung::new(1920, 1080).with_quality(Quality::crf(28)),
     Rung::new(1280, 720).with_quality(Quality::target(PerceptualTarget::Standard)),
 ])
-.with_audio(AudioPolicy::Auto)
+.with_audio(AudioCodecPolicy::Auto)
 .with_max_frame_rate(30.0)   // cap output cadence at 30 fps
 .web_sdr();                  // BT.709 8-bit SDR, tonemapping any HDR source down (default)
 
@@ -510,7 +510,7 @@ supports AV1 plays.
 | MP3    | —           | ✅ |
 | Vorbis | —           | ✅ |
 
-`AudioPolicy::Auto` passes through AAC/Opus/AC-3/E-AC-3, transcodes MP3/Vorbis to
+`AudioCodecPolicy::Auto` passes through AAC/Opus/AC-3/E-AC-3, transcodes MP3/Vorbis to
 Opus, and drops the rest. `ForceOpus` produces Opus from any decodable source;
 `Drop` yields video-only output. (Multichannel ≥3ch transcode is not yet
 supported and is dropped with a warning.)

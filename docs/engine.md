@@ -187,7 +187,7 @@ playlists around them.
 yields a `PreparedAudio { info, samples, handling }` shared by every rung. The
 routing mirrors the README's audio table: passthrough for AAC/Opus/AC-3/E-AC-3;
 decode→Opus for MP3/Vorbis; drop (with a warn) for the rest, including
-multichannel ≥3 ch. `AudioPolicy::ForceOpus` forces a transcode of anything not
+multichannel ≥3 ch. `AudioCodecPolicy::ForceOpus` forces a transcode of anything not
 already Opus; `Drop` removes audio. A `with_audio` rejection at mux time degrades
 to **video-only with a warn** rather than losing the customer's video
 ([`job.rs:392`](../crates/rivet/src/job.rs)).

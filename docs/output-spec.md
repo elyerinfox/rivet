@@ -7,7 +7,7 @@ documents every knob; for the internals see [pipeline & architecture](pipeline.m
 and for the CLI equivalents see the [CLI reference](cli.md).
 
 ```rust
-use rivet::{OutputSpec, Rung, Quality, AudioPolicy, EncodePolicy,
+use rivet::{OutputSpec, Rung, Quality, AudioCodecPolicy, EncodePolicy,
             ChunkSeamMode, PerceptualTarget, run_job_blocking, fn_sink};
 use rivet::progress::RungProgress;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ let spec = OutputSpec::single_file(vec![
     Rung::new(1280, 720).with_quality(Quality::target(PerceptualTarget::Standard)),
     Rung::new(854, 480),                              // default quality
 ])
-.with_audio(AudioPolicy::Auto)                        // passthrough / transcode / drop
+.with_audio(AudioCodecPolicy::Auto)                        // passthrough / transcode / drop
 .with_max_frame_rate(30.0)                            // cap output cadence
 .web_sdr()                                            // color preset: BT.709 8-bit SDR
 .encode_policy(EncodePolicy::AllGpus)                 // chunk-encode across every GPU
@@ -110,16 +110,16 @@ aspect ratio, even-aligns dims, and caps the top rung.
 
 ---
 
-## 3. Audio — `with_audio(AudioPolicy)`
+## 3. Audio — `with_audio(AudioCodecPolicy)`
 
-| `AudioPolicy` | Behavior |
+| `AudioCodecPolicy` | Behavior |
 |---------------|----------|
 | `Auto` *(default)* | Passthrough AAC / Opus / AC-3 / E-AC-3 verbatim; transcode MP3 / Vorbis → Opus; drop anything else. |
 | `ForceOpus` | Always produce Opus (passthrough Opus, transcode everything else). |
 | `Drop` | Video-only output. |
 
 ```rust
-spec.with_audio(AudioPolicy::ForceOpus)
+spec.with_audio(AudioCodecPolicy::ForceOpus)
 ```
 
 ---
@@ -167,10 +167,14 @@ HDR is tagged in the container via `colr`/`mdcv`/`clli` atoms.
 
 ## 5b. Output codec — `with_video_codec(...)`
 
-The output video codec is `VideoCodec::Av1` (default), `H264`, or `H265`:
+`VideoCodecPolicy` (the video analogue of [`AudioCodecPolicy`](#3-audio--with_audioaudiocodecpolicy))
+is `Av1` (default), `H264`, or `H265`. It resolves to the encoder/muxer's
+low-level `VideoCodec` via `VideoCodecPolicy::codec()`.
 
 ```rust
-let spec = OutputSpec::single_file(rungs).with_video_codec(VideoCodec::H264);
+use rivet::VideoCodecPolicy;
+
+let spec = OutputSpec::single_file(rungs).with_video_codec(VideoCodecPolicy::H264);
 ```
 
 **AV1** is the royalty-clean default (AV1 + Opus in MP4 = zero royalty exposure);
@@ -311,7 +315,7 @@ let sink = Arc::new(rivet::channel_sink(tx));
 |--------------|-----------|---------|
 | `single_file` | `(Vec<Rung>) -> Self` | [1](#1-construct--the-output-shape) |
 | `hls` | `(Vec<Rung>, f32) -> Self` | [1](#1-construct--the-output-shape) |
-| `with_audio` | `(AudioPolicy) -> Self` | [3](#3-audio--with_audioaudiopolicy) |
+| `with_audio` | `(AudioCodecPolicy) -> Self` | [3](#3-audio--with_audioaudiopolicy) |
 | `with_max_frame_rate` | `(f64) -> Self` | [5](#5-frame-rate--with_max_frame_ratefps) |
 | `with_color` | `(ColorPolicy) -> Self` | [4](#4-color--bit-depth) |
 | `with_bit_depth` | `(BitDepth) -> Self` | [4](#4-color--bit-depth) |

@@ -1,7 +1,7 @@
 //! Output specification — *how* a job should be transcoded.
 //!
 //! A job is described by an [`OutputSpec`]: the [`OutputMode`] (single file
-//! vs segmented HLS), the [`VideoCodec`] + [`AudioPolicy`], the [`Container`]
+//! vs segmented HLS), the [`VideoCodec`] + [`AudioCodecPolicy`], the [`Container`]
 //! + [`Muxer`], and the user-defined ladder of [`Rung`]s (each with its own
 //! [`Quality`]). Nothing about the output is hard-coded — the caller decides
 //! the shape, the codec, the quality, and the renditions.
@@ -25,18 +25,42 @@ use codec::frame::{ColorMetadata, PixelFormat, TransferFn};
 
 pub use codec::encode::tuning::{QualityTarget as PerceptualTarget, SpeedTier as Speed};
 
-/// Output video codec.
-///
-/// Output video codec — re-exported from [`codec::frame::VideoCodec`] so the
-/// spec, encoder, and muxer share one type. `Av1` (default, royalty-clean
-/// AV1 + Opus in MP4) plus `H264` / `H265` for legacy-player compatibility.
-/// H.264 / H.265 carry patent-licensing obligations AV1 was chosen to avoid;
-/// all three work for single-file MP4 and CMAF/HLS.
+/// The low-level codec identity used by the encoder + muxer, re-exported from
+/// [`codec::frame::VideoCodec`]. Most callers pick the codec via
+/// [`VideoCodecPolicy`] (the spec-level dimension) and never touch this directly;
+/// `VideoCodecPolicy::codec` resolves to it.
 pub use codec::frame::VideoCodec;
 
-/// How the source audio track is handled.
+/// Output **video** codec policy — the video analogue of [`AudioCodecPolicy`].
+/// Selects which codec the encoder produces:
+/// - `Av1` *(default)* — royalty-clean (AV1 + Opus in MP4 = zero royalty exposure).
+/// - `H264` / `H265` — for legacy-player compatibility; they carry the
+///   patent-licensing obligations AV1 was chosen to avoid.
+///
+/// All three work for single-file MP4 **and** CMAF/HLS. Resolve to the
+/// encoder/muxer's [`VideoCodec`] with [`VideoCodecPolicy::codec`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VideoCodecPolicy {
+    #[default]
+    Av1,
+    H264,
+    H265,
+}
+
+impl VideoCodecPolicy {
+    /// Resolve to the low-level [`VideoCodec`] the encoder + muxer consume.
+    pub fn codec(self) -> VideoCodec {
+        match self {
+            VideoCodecPolicy::Av1 => VideoCodec::Av1,
+            VideoCodecPolicy::H264 => VideoCodec::H264,
+            VideoCodecPolicy::H265 => VideoCodec::H265,
+        }
+    }
+}
+
+/// Output **audio** codec policy — how the source audio track is handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AudioPolicy {
+pub enum AudioCodecPolicy {
     /// Passthrough AAC / Opus / AC-3 / E-AC-3 verbatim; transcode MP3 /
     /// Vorbis to Opus; drop anything else.
     #[default]
@@ -46,6 +70,11 @@ pub enum AudioPolicy {
     /// Drop audio entirely (video-only output).
     Drop,
 }
+
+/// Deprecated alias for [`AudioCodecPolicy`] (renamed for symmetry with
+/// [`VideoCodecPolicy`]).
+#[deprecated(since = "0.1.5", note = "renamed to AudioCodecPolicy")]
+pub type AudioPolicy = AudioCodecPolicy;
 
 /// Output container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -189,10 +218,10 @@ impl Rung {
 pub struct OutputSpec {
     /// Output shape.
     pub mode: OutputMode,
-    /// Video codec (AV1 only today).
-    pub video_codec: VideoCodec,
+    /// Output video codec policy (`Av1` default, or `H264` / `H265`).
+    pub video_codec: VideoCodecPolicy,
     /// Audio handling.
-    pub audio: AudioPolicy,
+    pub audio: AudioCodecPolicy,
     /// Container format.
     pub container: Container,
     /// Muxer.
@@ -360,8 +389,8 @@ impl Default for OutputSpec {
     fn default() -> Self {
         Self {
             mode: OutputMode::SingleFile,
-            video_codec: VideoCodec::Av1,
-            audio: AudioPolicy::Auto,
+            video_codec: VideoCodecPolicy::Av1,
+            audio: AudioCodecPolicy::Auto,
             container: Container::Mp4,
             muxer: Muxer::Mp4File,
             rungs: Vec::new(),
@@ -401,7 +430,7 @@ impl OutputSpec {
     }
 
     /// Set the audio policy.
-    pub fn with_audio(mut self, audio: AudioPolicy) -> Self {
+    pub fn with_audio(mut self, audio: AudioCodecPolicy) -> Self {
         self.audio = audio;
         self
     }
@@ -507,9 +536,9 @@ impl OutputSpec {
         self
     }
 
-    /// Set the output video codec (`Av1` default, or `H264` / `H265`). All three
-    /// work for single-file MP4 and CMAF/HLS.
-    pub fn with_video_codec(mut self, codec: VideoCodec) -> Self {
+    /// Set the output video codec ([`VideoCodecPolicy::Av1`] default, or `H264` /
+    /// `H265`). All three work for single-file MP4 and CMAF/HLS.
+    pub fn with_video_codec(mut self, codec: VideoCodecPolicy) -> Self {
         self.video_codec = codec;
         self
     }

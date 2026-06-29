@@ -583,7 +583,7 @@ jobs:
     fn codec_field_selects_output_codec() {
         let yaml = "jobs:\n  - input: a.mkv\n    output: a.mp4\n    codec: h265\n";
         let s = parse_manifest(yaml, Format::Yaml).unwrap().jobs[0].to_settings().unwrap();
-        assert_eq!(s.video_codec, Some(codec::frame::VideoCodec::H265));
+        assert_eq!(s.video_codec, Some(crate::spec::VideoCodecPolicy::H265));
         // omitted → None → AV1 default at spec-build time
         let plain = "jobs:\n  - input: a.mkv\n    output: a.mp4\n";
         let s2 = parse_manifest(plain, Format::Yaml).unwrap().jobs[0].to_settings().unwrap();

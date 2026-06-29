@@ -15,7 +15,7 @@ Three load-bearing decisions shape this whole side, and they recur below:
    [README's "note on the output codec"](../README.md#a-note-on-the-output-codec)).
    **H.264 / H.265** are available for legacy-player compatibility — they carry
    the patent-licensing obligations AV1 was chosen to avoid. The codec is
-   selected per job (`OutputSpec::with_video_codec(VideoCodec::H264)` /
+   selected per job (`OutputSpec::with_video_codec(VideoCodecPolicy::H264)` /
    `--codec h264` / `codec=h264`; values `av1|h264|h265`). See
    [Output codecs](#output-codecs-av1--h264--h265) below.
 2. **Hardware encoders are layered, not consolidated.** Each vendor gets a
