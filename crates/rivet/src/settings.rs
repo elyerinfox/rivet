@@ -56,6 +56,10 @@ pub struct TranscodeSettings {
     pub filters: Vec<codec::filter::VideoFilter>,
     /// Output video codec: `av1` (default), `h264`, or `h265`. `None` = av1.
     pub video_codec: Option<crate::spec::VideoCodecPolicy>,
+    /// Splice **trim in-point** in seconds (`None` = start of input).
+    pub trim_start: Option<f64>,
+    /// Splice **trim out-point** in seconds (`None` = end of input).
+    pub trim_end: Option<f64>,
 }
 
 impl TranscodeSettings {
@@ -123,6 +127,7 @@ impl TranscodeSettings {
         };
         spec = spec.decode_gpu(self.decode_gpu);
         spec = spec.with_filters(self.filters);
+        spec = spec.with_trim(self.trim_start, self.trim_end);
         if let Some(c) = self.video_codec {
             spec = spec.with_video_codec(c);
         }

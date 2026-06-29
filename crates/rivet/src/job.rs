@@ -239,6 +239,10 @@ async fn run_single_file(
         // `ChunkSeamMode::Serial` forces one encoder (seam-free) even on a
         // multi-GPU host — skip the chunk-and-stitch path entirely.
         && spec.chunk_seam_mode != crate::spec::ChunkSeamMode::Serial
+        // Trim/splice jobs take the serial path: the multi-GPU chunker sizes its
+        // chunks from the full source frame count, which a trim invalidates.
+        && spec.trim_start.is_none()
+        && spec.trim_end.is_none()
     {
         // The chunk-and-stitch path's codec invariant now handles av1C / avcC /
         // hvcC, so AV1, H.264, and H.265 all chunk across GPUs. Each chunk is a
@@ -284,6 +288,22 @@ async fn run_single_file(
         gpu_index: decode_gpu,
         filters: Arc::clone(&filter_chain),
     };
+    // Splice trim: seconds → source frame indices (at the output cadence). The
+    // pump drops frames outside `[start_frame, end_frame)`; the muxer re-numbers
+    // the kept frames from zero, so the output timeline is trimmed and rebased.
+    let start_frame = spec
+        .trim_start
+        .map(|s| (s.max(0.0) * frame_rate).round() as u64)
+        .unwrap_or(0);
+    let end_frame = spec.trim_end.map(|e| (e.max(0.0) * frame_rate).round() as u64);
+    // Progress is reported against the trimmed length, not the full source.
+    let effective_total = match (end_frame, frames_total) {
+        (Some(end), _) => Some(end.saturating_sub(start_frame)),
+        (None, Some(t)) => Some(t.saturating_sub(start_frame)),
+        (None, None) => None,
+    };
+    // Trim the prepared audio to the same window so A/V stay aligned.
+    let trimmed_audio = trim_audio(audio, spec.trim_start, spec.trim_end);
     let rt = tokio::runtime::Handle::current();
 
     let mut senders = Vec::with_capacity(spec.rungs.len());
@@ -293,10 +313,10 @@ async fn run_single_file(
         senders.push(tx);
         let sink = Arc::clone(&sink);
         let base_cfg = base_cfg.clone();
-        let audio = audio.cloned();
+        let audio = trimmed_audio.clone();
         let handle = tokio::task::spawn_blocking(move || {
             let r = encode_rung_single_file(
-                idx, &rung, rx, base_cfg, backend_override, frame_rate, frames_total,
+                idx, &rung, rx, base_cfg, backend_override, frame_rate, effective_total,
                 audio.as_ref(), sink.as_ref(),
             );
             (idx, rung, r)
@@ -308,7 +328,13 @@ async fn run_single_file(
         let input = input.clone();
         let rt = rt.clone();
         tokio::task::spawn_blocking(move || {
-            run_shared_decode_pump_blocking(pump_cfg, input, senders, rt)
+            let clip = crate::decode_pump::ClipSource {
+                cfg: pump_cfg,
+                input,
+                start_frame,
+                end_frame,
+            };
+            crate::decode_pump::run_spliced_decode_pump_blocking(vec![clip], senders, rt)
         })
     };
 
@@ -647,6 +673,45 @@ impl PreparedAudio {
     fn has_samples(&self) -> bool {
         !self.samples.is_empty()
     }
+
+    /// Append another track's samples after this one (for splice concat). The
+    /// muxer re-times from the running duration, so the joined audio is gap-free.
+    fn extend(&mut self, other: &PreparedAudio) {
+        self.samples.extend(other.samples.iter().cloned());
+    }
+}
+
+/// Trim a prepared audio track to the window `[start, end)` seconds, dropping
+/// packets outside it. Kept packets retain their explicit durations, so the
+/// muxer re-times them from zero — aligning with the trimmed, rebased video.
+/// Cut points land on packet boundaries (≤ ~20 ms), which is fine for A/V sync.
+/// `None`/`None` returns the track unchanged.
+fn trim_audio(
+    audio: Option<&PreparedAudio>,
+    start: Option<f64>,
+    end: Option<f64>,
+) -> Option<PreparedAudio> {
+    let a = audio?;
+    if start.is_none() && end.is_none() {
+        return Some(a.clone());
+    }
+    let ticks_per_sec = a.info.timescale.max(1) as f64;
+    let start_tick = (start.unwrap_or(0.0).max(0.0) * ticks_per_sec) as u64;
+    let end_tick = end.map(|e| (e.max(0.0) * ticks_per_sec) as u64);
+    let mut acc: u64 = 0;
+    let mut kept = Vec::new();
+    for (payload, dur) in &a.samples {
+        let sample_start = acc;
+        acc += *dur as u64;
+        if sample_start < start_tick {
+            continue;
+        }
+        if end_tick.is_some_and(|et| sample_start >= et) {
+            break;
+        }
+        kept.push((payload.clone(), *dur));
+    }
+    Some(PreparedAudio { info: a.info.clone(), samples: kept, handling: a.handling.clone() })
 }
 
 fn prepare_audio(track: Option<&AudioTrack>, policy: AudioCodecPolicy) -> Result<Option<PreparedAudio>> {

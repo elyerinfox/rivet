@@ -252,6 +252,15 @@ pub struct OutputSpec {
     /// Video filters applied per-frame **before** per-rung scaling (crop, pad,
     /// flip, rotate, grayscale). Empty = none. See [`codec::filter`].
     pub filters: Vec<codec::filter::VideoFilter>,
+    /// Splice **trim in-point**, in seconds from the start of the (single)
+    /// input. `None` starts at the beginning. Frames before this point are
+    /// decoded-and-dropped; the output timeline is re-based to zero. For
+    /// multi-clip concatenation use [`run_splice_job`](crate::run_splice_job)
+    /// with a per-clip range instead. Trimmed jobs take the serial encode path.
+    pub trim_start: Option<f64>,
+    /// Splice **trim out-point**, in seconds. `None` keeps the clip to its end.
+    /// The kept range is `[trim_start, trim_end)`.
+    pub trim_end: Option<f64>,
 }
 
 /// Selects how a job's encode work is distributed across the host's GPUs.
@@ -402,6 +411,8 @@ impl Default for OutputSpec {
             bit_depth: BitDepth::default(),
             chunk_seam_mode: ChunkSeamMode::default(),
             filters: Vec::new(),
+            trim_start: None,
+            trim_end: None,
         }
     }
 }
@@ -533,6 +544,16 @@ impl OutputSpec {
     /// grayscale), applied before per-rung scaling. See [`codec::filter`].
     pub fn with_filters(mut self, filters: Vec<codec::filter::VideoFilter>) -> Self {
         self.filters = filters;
+        self
+    }
+
+    /// **Trim** the single input to the time range `[start, end)` in seconds
+    /// (either bound `None` = open). The output is re-based to zero. Trimmed
+    /// jobs use the serial encode path. For joining multiple clips, see
+    /// [`run_splice_job`](crate::run_splice_job).
+    pub fn with_trim(mut self, start: Option<f64>, end: Option<f64>) -> Self {
+        self.trim_start = start;
+        self.trim_end = end;
         self
     }
 

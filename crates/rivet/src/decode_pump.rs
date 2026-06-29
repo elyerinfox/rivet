@@ -45,77 +45,158 @@ pub struct DecodePumpConfig {
     pub filters: std::sync::Arc<codec::filter::FilterChain>,
 }
 
-/// Blocking decode loop, designed for `tokio::task::spawn_blocking`. Fans
-/// every normalized frame out to all `senders`. If a sender's channel is
-/// closed (its rung gave up) the pump continues with the rest; it stops only
-/// when *every* sender is closed. `rt` bridges into the async `send().await`.
-///
-/// Returns the number of frames pushed.
+/// One clip of a splice: a decode config, its source bytes, and the **source
+/// frame range** to keep. The first `start_frame` decoded frames are dropped
+/// (the trim in-point); decoding stops once the source index reaches
+/// `end_frame` (exclusive — the trim out-point). `end_frame = None` keeps the
+/// clip to its end. A single full-range clip (`start_frame = 0`,
+/// `end_frame = None`) is a plain, un-spliced transcode.
+pub struct ClipSource {
+    pub cfg: DecodePumpConfig,
+    pub input: Bytes,
+    pub start_frame: u64,
+    pub end_frame: Option<u64>,
+}
+
+impl ClipSource {
+    /// A whole clip, no trim.
+    pub fn whole(cfg: DecodePumpConfig, input: Bytes) -> Self {
+        Self { cfg, input, start_frame: 0, end_frame: None }
+    }
+}
+
+/// Single-input decode pump (no trim, no concat) — the common case. A thin
+/// wrapper over [`run_spliced_decode_pump_blocking`] with one whole clip.
 pub fn run_shared_decode_pump_blocking(
     cfg: DecodePumpConfig,
     input_data: Bytes,
     senders: Vec<tokio::sync::mpsc::Sender<VideoFrame>>,
     rt: tokio::runtime::Handle,
 ) -> Result<u64> {
-    let outcome = decode_loop(&cfg, input_data, &senders, &rt);
-    // Drop senders so receivers wake and exit.
-    drop(senders);
-    outcome
+    run_spliced_decode_pump_blocking(vec![ClipSource::whole(cfg, input_data)], senders, rt)
 }
 
-fn decode_loop(
-    cfg: &DecodePumpConfig,
-    input_data: Bytes,
+/// Spliced decode pump, designed for `tokio::task::spawn_blocking`. Decodes
+/// each clip in order, **drops** frames outside the clip's `[start_frame,
+/// end_frame)` source range (trim), and fans the kept frames out to all
+/// `senders` **continuously across clips** (concat). Because the muxer numbers
+/// output frames by count — not by source PTS — the join is automatically
+/// gap-free and the timeline is zero-based, with no PTS rewriting.
+///
+/// If a sender's channel is closed (its rung gave up) the pump keeps going with
+/// the rest; it stops only when *every* sender is closed. `rt` bridges into the
+/// async `send().await`. Returns the total number of frames emitted.
+pub fn run_spliced_decode_pump_blocking(
+    clips: Vec<ClipSource>,
+    senders: Vec<tokio::sync::mpsc::Sender<VideoFrame>>,
+    rt: tokio::runtime::Handle,
+) -> Result<u64> {
+    let mut total: u64 = 0;
+    let result = (|| {
+        for (clip_idx, clip) in clips.iter().enumerate() {
+            match decode_clip(clip, &senders, &rt, &mut total)
+                .with_context(|| format!("decoding splice clip {clip_idx}"))?
+            {
+                Flow::Continue => {}
+                Flow::AllReceiversClosed => break,
+            }
+        }
+        Ok(total)
+    })();
+    // Drop senders so receivers wake and exit.
+    drop(senders);
+    result
+}
+
+enum Flow {
+    Continue,
+    AllReceiversClosed,
+}
+
+/// Decode one clip, applying its trim range, fanning kept frames to `senders`
+/// and advancing the shared output counter `total`.
+fn decode_clip(
+    clip: &ClipSource,
     senders: &[tokio::sync::mpsc::Sender<VideoFrame>],
     rt: &tokio::runtime::Handle,
-) -> Result<u64> {
+    total: &mut u64,
+) -> Result<Flow> {
+    let cfg = &clip.cfg;
     let mut demuxer =
-        streaming::demux_streaming(&input_data).context("demuxing input for shared decode pump")?;
+        streaming::demux_streaming(&clip.input).context("demuxing clip for decode pump")?;
     let mut decoder =
         decode::create_decoder_on(&cfg.codec_name, cfg.info_for_decoder.clone(), cfg.gpu_index)
-            .context("creating decoder for shared decode pump")?;
+            .context("creating decoder for decode pump")?;
 
-    let mut frames_pushed: u64 = 0;
-    'outer: loop {
+    // Source-frame index within THIS clip — drives the trim decision.
+    let mut src_idx: u64 = 0;
+    loop {
         match demuxer
             .next_video_sample()
-            .context("demuxing next video sample in shared decode pump")?
+            .context("demuxing next video sample in decode pump")?
         {
             Some(sample) => {
                 decoder
                     .push_sample(&sample.data)
-                    .context("pushing sample to shared decode pump decoder")?;
-                while let Some(frame) = decoder
-                    .decode_next()
-                    .context("decoding frame in shared decode pump")?
+                    .context("pushing sample to decode pump decoder")?;
+                while let Some(frame) =
+                    decoder.decode_next().context("decoding frame in decode pump")?
                 {
-                    let normalized = normalize_frame(cfg, frame)?;
-                    if !fan_out(senders, normalized, rt)? {
-                        break 'outer;
+                    match handle_frame(clip, cfg, frame, senders, rt, &mut src_idx, total)? {
+                        FrameAction::Continue => {}
+                        FrameAction::ClipDone => return Ok(Flow::Continue),
+                        FrameAction::StopAll => return Ok(Flow::AllReceiversClosed),
                     }
-                    frames_pushed += 1;
                 }
             }
             None => {
-                decoder
-                    .finish()
-                    .context("decoder finish in shared decode pump")?;
+                decoder.finish().context("decoder finish in decode pump")?;
                 while let Some(frame) = decoder
                     .decode_next()
-                    .context("decoding frame after finish in shared decode pump")?
+                    .context("decoding frame after finish in decode pump")?
                 {
-                    let normalized = normalize_frame(cfg, frame)?;
-                    if !fan_out(senders, normalized, rt)? {
-                        break;
+                    match handle_frame(clip, cfg, frame, senders, rt, &mut src_idx, total)? {
+                        FrameAction::Continue => {}
+                        FrameAction::ClipDone => return Ok(Flow::Continue),
+                        FrameAction::StopAll => return Ok(Flow::AllReceiversClosed),
                     }
-                    frames_pushed += 1;
                 }
                 break;
             }
         }
     }
+    Ok(Flow::Continue)
+}
 
-    Ok(frames_pushed)
+enum FrameAction {
+    Continue,
+    ClipDone,
+    StopAll,
+}
+
+/// Apply the clip's trim range to one decoded frame: drop frames before the
+/// in-point, signal `ClipDone` at the out-point, otherwise normalize + fan out.
+fn handle_frame(
+    clip: &ClipSource,
+    cfg: &DecodePumpConfig,
+    frame: VideoFrame,
+    senders: &[tokio::sync::mpsc::Sender<VideoFrame>],
+    rt: &tokio::runtime::Handle,
+    src_idx: &mut u64,
+    total: &mut u64,
+) -> Result<FrameAction> {
+    if clip.end_frame.is_some_and(|end| *src_idx >= end) {
+        return Ok(FrameAction::ClipDone); // reached the out-point
+    }
+    if *src_idx >= clip.start_frame {
+        let normalized = normalize_frame(cfg, frame)?;
+        if !fan_out(senders, normalized, rt)? {
+            return Ok(FrameAction::StopAll);
+        }
+        *total += 1;
+    }
+    *src_idx += 1;
+    Ok(FrameAction::Continue)
 }
 
 /// Rung-agnostic per-frame work: 4:4:4 → 4:2:0 downsample (if needed) then,

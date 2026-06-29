@@ -229,6 +229,13 @@ enum Command {
         /// All three work for single-file MP4 and CMAF/HLS.
         #[arg(long)]
         codec: Option<String>,
+        /// Splice: trim the input, keeping from this time (seconds). The output
+        /// is re-based to zero. Trimmed jobs use the serial encode path.
+        #[arg(long)]
+        trim_start: Option<f64>,
+        /// Splice: trim the input, keeping until this time (seconds).
+        #[arg(long)]
+        trim_end: Option<f64>,
     },
     /// Inspect an input file without transcoding it.
     Probe {
@@ -361,6 +368,8 @@ fn run() -> Result<()> {
             seam_mode,
             filter,
             codec,
+            trim_start,
+            trim_end,
         } => transcode_cmd(TranscodeArgs {
             input,
             output,
@@ -382,6 +391,8 @@ fn run() -> Result<()> {
             seam_mode,
             filter,
             codec,
+            trim_start,
+            trim_end,
         }),
         Command::Probe { input, json } => {
             let info = rivet::probe_file(&input)
@@ -470,6 +481,8 @@ struct TranscodeArgs {
     seam_mode: SeamArg,
     filter: Option<String>,
     codec: Option<String>,
+    trim_start: Option<f64>,
+    trim_end: Option<f64>,
 }
 
 fn transcode_cmd(args: TranscodeArgs) -> Result<()> {
@@ -520,6 +533,8 @@ fn transcode_cmd(args: TranscodeArgs) -> Result<()> {
         height: None,
         filters,
         video_codec,
+        trim_start: args.trim_start,
+        trim_end: args.trim_end,
     };
     let spec = settings
         .into_spec(probed.width, probed.height)
