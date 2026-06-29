@@ -48,9 +48,10 @@ never branches on which GPU produced the pixels.
 | [`src/decode/mod.rs`](../crates/codec/src/decode/mod.rs) | The `Decoder` trait + `create_decoder` GPU dispatch, the `DISABLE_*` env knobs, shared NV12/P010 deinterleave helpers, and the `capabilities` introspection. |
 | [`src/decode/nvdec.rs`](../crates/codec/src/decode/nvdec.rs) | NVIDIA NVDEC/CUVID streaming decode — hand-rolled libnvcuvid FFI with ABI-pinned structs. |
 | [`src/decode/qsv_dec.rs`](../crates/codec/src/decode/qsv_dec.rs) | Intel QSV/oneVPL decode — hand-rolled libvpl FFI, internal-allocation + `FrameInterface::Map`. |
-| [`src/decode/amf_dec.rs`](../crates/codec/src/decode/amf_dec.rs) | AMD AMF decode — hand-rolled AMF COM-style vtable FFI (verified-by-review). |
+| [`src/decode/amf_dec.rs`](../crates/codec/src/decode/amf_dec.rs) | AMD AMF decode — hand-rolled AMF COM-style vtable FFI. Init + Windows adapter routing exercised; per-frame decode verified-by-review (no AMF-capable card on hand). |
+| [`src/amf_device.rs`](../crates/codec/src/amf_device.rs) | Windows-only: hand-rolled DXGI/D3D11 dlopen FFI that makes a D3D11 device on a *specific* AMD adapter, so AMF's `InitDX11` binds to the right GPU on a mixed host (gated `windows` + `amd`). |
 | [`src/decode/ffmpeg.rs`](../crates/codec/src/decode/ffmpeg.rs) | libavcodec decode via `ffmpeg-next` (optional `ffmpeg` feature), with hwaccel device selection. |
-| [`src/gpu.rs`](../crates/codec/src/gpu.rs) | GPU detection (`detect_gpus`), `GpuDevice`/`GpuVendor`, NVML/sysfs enrichment, live-utilisation reader, `supports_av1_encode`. |
+| [`src/gpu.rs`](../crates/codec/src/gpu.rs) | GPU detection (`detect_gpus`), `GpuDevice`/`GpuVendor`, NVML + sysfs (Linux) / WMI (Windows) enrichment, global vs vendor-local indices, live-utilisation reader, `supports_av1_encode`. |
 | [`src/cuda_lock.rs`](../crates/codec/src/cuda_lock.rs) | Process-wide CUDA-init mutex shared by NVENC + NVDEC (`nvidia` feature only). |
 | [`src/probe.rs`](../crates/codec/src/probe.rs) | Media probing without a full decode (MP4 header walk + container sniff + HDR box extraction). |
 | [`src/pixel_format.rs`](../crates/codec/src/pixel_format.rs) | Pure-Rust bitstream parsers: SPS/PPS/sequence-header walkers for H.264 / HEVC / AV1 / MPEG-2 (pixel format + dimensions). |
@@ -349,18 +350,40 @@ H.264/HEVC/AV1/VP9. The whole AMF object model is reproduced as `#[repr(C)]` vta
 structs ([factory/context/component/surface/plane/buffer](../crates/codec/src/decode/amf_dec.rs#L61-L208)),
 shared in spirit with the AMF encoder.
 
-**Why it's the most caveated backend.** There is **no AMD RDNA-class card on the
-dev box**, so it's "verified-by-review only." The most fragile guess is the
-[`AMF_IID_SURFACE` GUID](../crates/codec/src/decode/amf_dec.rs#L48) used to
+**Multi-adapter routing (Windows).** AMF's `InitDX11(null)` lets the runtime
+create its device on **DXGI adapter 0** — which on a mixed host (an NVIDIA card in
+slot 0 + an AMD GPU elsewhere) is the wrong, non-AMD adapter, and init fails. So
+on Windows we build the D3D11 device ourselves on the chosen AMD adapter:
+[`amf_device::create_amd_d3d11_device`](../crates/codec/src/amf_device.rs)
+enumerates adapters via DXGI, finds the `vendor_index`-th `0x1002` one, and
+`D3D11CreateDevice`s it with `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` — then hands that
+device to `InitDX11` (the decoder keeps it alive for the context's lifetime). On
+Linux the `InitVulkan(null)` path is kept (AMF picks the first AMD GPU). This is
+the `gpu_index` plumbing actually doing something — see [GPU detection](#gpu-detection)
+for how a global index maps to a vendor-local adapter.
+
+**Why it's the most caveated backend.** The only AMD silicon on the dev box is a
+Ryzen desktop iGPU whose VCN the AMF runtime does **not** support — `InitDX11`
+returns `AMF_NOT_FOUND` for it (the AMF *encoder* probe fails on it too). So
+**detection, the D3D11 adapter routing, and the init/teardown path are exercised,
+but the per-frame `SubmitInput` → `QueryOutput` → surface-readback loop has not run
+end-to-end** — that needs a discrete Radeon (RDNA) or a supported APU. The most
+fragile decode-loop guess is the
+[`AMF_IID_SURFACE` GUID](../crates/codec/src/decode/amf_dec.rs#L66) used to
 `QueryInterface` the output `AMFData` into an `AMFSurface` — a wrong IID fails every
-output. Spots like that, the host-memory read-back, and the `Convert` slot are all
-flagged `// VERIFY:` and tracked in TODO.md; `ffmpeg` is the documented AMD
-fallback.
+output. That, the host-memory read-back, and the `Convert` slot are flagged
+`// VERIFY:`; `ffmpeg` is the documented AMD fallback.
 
 **Notes / gotchas.**
-- `InitDX11` is tried first, then `InitVulkan` on failure.
-- `gpu_index != 0` logs a warning — AMF decode currently picks adapter 0
-  unconditionally.
+- `gpu_index` now selects the AMD adapter on Windows (via the D3D11 routing
+  above), **not** "adapter 0 unconditionally" as older comments claimed.
+- A **failed `InitDX11` no longer segfaults.** Tearing down an AMF context whose
+  `InitDX11(external device)` failed corrupts the runtime's state (even
+  `Release`/`Terminate` crash), so on that cold error path the half-initialised
+  context is leaked and a clear error returned. This is what lets `--decode-gpu
+  fastest` benchmark an AMD GPU, catch an init failure, and **skip it** instead of
+  taking the process down; an AMF-incapable GPU surfaces as
+  `AMFContext::InitDX11 … AMF_NOT_FOUND=11`.
 
 ### FFmpeg — `decode/ffmpeg.rs`
 
@@ -397,6 +420,16 @@ exposes live utilisation. [`detect_gpus()`](../crates/codec/src/gpu.rs#L65)
 concatenates per-vendor scans into `Vec<`[`GpuDevice`](../crates/codec/src/gpu.rs#L13)`>`
 (vendor, name, index, generation, PCI id, VRAM, serial, bus address).
 
+**Two indices, because a host can be mixed.** Each per-vendor scan numbers its own
+devices from 0, so on an NVIDIA + AMD box both would be index 0. `GpuDevice`
+therefore carries **two**: `vendor_index` (the device's position *within its
+vendor*, what the per-vendor SDK enumerates — the CUDA ordinal, the QSV/AMF
+adapter) and a globally-unique `index` that `detect_gpus` reassigns across the
+concatenated list. The global `index` is what the user addresses (`--decode-gpu N`,
+the GPU policy) and what `create_decoder_on` matches; it then constructs the
+chosen backend with that device's **`vendor_index`** so the hardware selects the
+right physical adapter. On a single-vendor host the two coincide.
+
 - **NVIDIA** via [libcuda dlopen](../crates/codec/src/gpu.rs#L99) (`cuInit` +
   `cuDeviceGetCount` + `cuDeviceGetName`), enriched by NVML for VRAM/PCI/serial.
   **Why dlopen, not `nvidia-smi`:** minimal container images often lack the
@@ -404,9 +437,13 @@ concatenates per-vendor scans into `Vec<`[`GpuDevice`](../crates/codec/src/gpu.r
   user-mode libraries — so probing the library directly works where shelling out
   wouldn't. (NVML init even retries the SONAME-versioned `libnvidia-ml.so.1`
   because the toolkit mounts only that, not the unsuffixed alias.)
-- **AMD / Intel** via [sysfs PCI scan](../crates/codec/src/gpu.rs#L370)
-  (`/sys/bus/pci/devices`, matching vendor `0x1002` / `0x8086` + a display class),
-  with device-id → generation/label tables.
+- **AMD / Intel** via, on **Linux**, a [sysfs PCI scan](../crates/codec/src/gpu.rs#L370)
+  (`/sys/bus/pci/devices`, matching vendor `0x1002` / `0x8086` + a display class);
+  on **Windows**, a WMI query (`Get-CimInstance Win32_VideoController`, cached for
+  the process) parsing the `PNPDeviceID` `VEN_`/`DEV_` fields. Both feed the same
+  device-id → generation/label tables. This is what makes an AMD GPU visible to
+  the AMF decode path on a Windows host (without it the sysfs-only scan returned
+  empty there, so only the NVML-detected NVIDIA card showed up).
 
 The generation/label tables ([`nvidia_generation_from_name`](../crates/codec/src/gpu.rs#L300),
 [`intel_label_from_device_id`](../crates/codec/src/gpu.rs#L680), …) are partly

@@ -51,8 +51,28 @@ Remaining: only a nice-to-have.
 ## AMD — `amd`
 
 Hand-rolled AMF FFI mirroring the AMD AMF SDK headers (`decode/amf_dec.rs`,
-`encode/amf.rs`). **Both decode and encode are by-review only — no AMD card on
-either box yet.**
+`encode/amf.rs`), plus `amf_device.rs` (Windows DXGI/D3D11 adapter routing).
+
+**Done (2026-06-29, on the RTX 3090 + Ryzen 9700X box):**
+- **Windows AMD/Intel GPU detection** (WMI `Win32_VideoController`) — AMD GPUs are
+  enumerated on Windows, not just via Linux sysfs.
+- **Heterogeneous index space** — `GpuDevice::vendor_index` (vendor-local, for the
+  hardware adapter) + a globally-unique `index` (what the user addresses), so an
+  NVIDIA + AMD host no longer collides on index 0.
+- **AMF multi-adapter routing** — a D3D11 device made on the chosen AMD adapter
+  (`D3D11_CREATE_DEVICE_VIDEO_SUPPORT`) is handed to `InitDX11`, so AMF binds to
+  the right GPU on a mixed host instead of DXGI adapter 0 (the NVIDIA card). The
+  iGPU is detected as global index 1 and AMF reaches it (D3D11 create/drop test
+  passes).
+- **Graceful failure** — a failed AMF init no longer segfaults (the
+  external-device failure path corrupts the context, so it's leaked on that cold
+  path); `--decode-gpu fastest` skips an AMF-incapable GPU and an explicit pin
+  errors cleanly.
+
+> The only AMD silicon on hand is the **Ryzen 9700X desktop iGPU, which is not
+> AMF-capable** — `InitDX11` returns `AMF_NOT_FOUND` for it (the encode probe fails
+> too). So the per-frame decode loop still can't be run here; it needs a discrete
+> Radeon (RDNA) or a supported APU.
 
 > Expect the same class of struct-layout / init-flow surprises QSV had on first
 > real hardware. QSV needed: every mfx struct offsetof-verified, the MFXLoad
@@ -61,9 +81,10 @@ either box yet.**
 > for an equivalent debugging pass on AMF.
 
 Verify on RDNA-class silicon (RX 7000+ for AV1 encode):
-- [ ] **AMF decode** — H.264 / HEVC / AV1 produce correct pixels. The
-      `AMF_IID_SURFACE` GUID and the host-memory surface read-back are best-guess;
-      compare a frame hash against `ffmpeg`.
+- [ ] **AMF decode pixels** — H.264 / HEVC / AV1 produce correct frames. The
+      `SubmitInput`→`QueryOutput`→readback loop, the `AMF_IID_SURFACE` GUID, and
+      the host-memory `Convert` slot are still best-guess; compare a frame hash
+      against `ffmpeg`. (Detection + adapter routing + init/teardown are done.)
 - [ ] **AMF encode** — AV1 8-bit and 10-bit (P010) end-to-end, correct pixels.
 
 ---
