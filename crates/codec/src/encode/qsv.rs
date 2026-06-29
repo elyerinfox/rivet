@@ -106,15 +106,21 @@ const MFX_RATECONTROL_ICQ: u16 = 9;
 // AV1 profile (MAIN = 1 per vendor/intel/mfxav1.h:24, 0 = "auto").
 const MFX_PROFILE_AV1_MAIN: u16 = 1;
 // H.264 / H.265 profiles (vendor/intel/mfxstructures.h). AVC High = 100,
-// HEVC Main = 1 — both 8-bit 4:2:0, matching our SDR output.
+// HEVC Main = 1 (8-bit 4:2:0); HEVC Main 10 = 2 (10-bit 4:2:0). oneVPL has no
+// AVC High 10 constant — Intel QSV does not encode 10-bit H.264, so 10-bit AVC
+// keeps the High profile and `MFXVideoENCODE_Query` rejects it before Init.
 const MFX_PROFILE_AVC_HIGH: u16 = 100;
 const MFX_PROFILE_HEVC_MAIN: u16 = 1;
+const MFX_PROFILE_HEVC_MAIN10: u16 = 2;
 
-/// Map our `VideoCodec` to the QSV `(codec_id, codec_profile)` pair.
-fn qsv_codec_ids(codec: crate::frame::VideoCodec) -> (u32, u16) {
+/// Map our `VideoCodec` + pixel format to the QSV `(codec_id, codec_profile)`
+/// pair. 10-bit H.265 selects Main 10; 10-bit H.264 stays High (QSV rejects it).
+fn qsv_codec_ids(codec: crate::frame::VideoCodec, fmt: PixelFormat) -> (u32, u16) {
+    let ten_bit = fmt == PixelFormat::Yuv420p10le;
     match codec {
         crate::frame::VideoCodec::Av1 => (MFX_CODEC_AV1, MFX_PROFILE_AV1_MAIN),
         crate::frame::VideoCodec::H264 => (MFX_CODEC_AVC, MFX_PROFILE_AVC_HIGH),
+        crate::frame::VideoCodec::H265 if ten_bit => (MFX_CODEC_HEVC, MFX_PROFILE_HEVC_MAIN10),
         crate::frame::VideoCodec::H265 => (MFX_CODEC_HEVC, MFX_PROFILE_HEVC_MAIN),
     }
 }
@@ -779,7 +785,7 @@ impl QsvEncoder {
             // above puts the value in the correct slot per the
             // vendored header.
 
-            let (codec_id, codec_profile) = qsv_codec_ids(config.codec);
+            let (codec_id, codec_profile) = qsv_codec_ids(config.codec, config.pixel_format);
             let mfx = MfxInfoMfx {
                 reserved: [0; 7],
                 // LowPower from the tuning adapter. AV1 QSV encode is VDENC

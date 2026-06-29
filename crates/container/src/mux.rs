@@ -2340,6 +2340,11 @@ pub(crate) fn build_avcc(sps: &[Vec<u8>], pps: &[Vec<u8>]) -> Vec<u8> {
 /// arrays follow. 4-byte NAL length prefixes.
 pub(crate) fn build_hvcc(vps: &[Vec<u8>], sps: &[Vec<u8>], pps: &[Vec<u8>]) -> Vec<u8> {
     let mut ptl = [0u8; 12];
+    // Bit depth (minus 8) + chroma format parsed from the SPS — 0/1 for Main
+    // 4:2:0 8-bit, 2/1 for Main 10 (10-bit 4:2:0). The hvcC carries these
+    // explicitly (bytes 16-18), so a Main 10 stream must report 2 here or
+    // strict decoders mis-configure the surface.
+    let (mut bit_depth_luma_m8, mut bit_depth_chroma_m8, mut chroma_format) = (0u8, 0u8, 1u8);
     if let Some(s) = sps.first() {
         let rbsp = strip_emulation(s);
         if rbsp.len() >= 15 {
@@ -2348,15 +2353,23 @@ pub(crate) fn build_hvcc(vps: &[Vec<u8>], sps: &[Vec<u8>], pps: &[Vec<u8>]) -> V
             ptl[0] = 0x01; // Main profile
             ptl[11] = 123; // level 4.1
         }
+        // parse_hevc_sps wants Annex-B; prepend a start code to the raw NAL.
+        let mut annexb = vec![0u8, 0, 0, 1];
+        annexb.extend_from_slice(s);
+        if let Some(info) = codec::pixel_format::parse_hevc_sps(&annexb) {
+            bit_depth_luma_m8 = info.bit_depth_luma.saturating_sub(8);
+            bit_depth_chroma_m8 = info.bit_depth_chroma.saturating_sub(8);
+            chroma_format = info.chroma_format_idc;
+        }
     }
     let mut body = Vec::new();
     body.push(1); // configurationVersion
     body.extend_from_slice(&ptl); // [1..13] general PTL
     body.extend_from_slice(&[0xF0, 0x00]); // [13-14] reserved | min_spatial_segmentation_idc=0
     body.push(0xFC); // [15] reserved | parallelismType=0
-    body.push(0xFC | 0x01); // [16] reserved | chromaFormat=1 (4:2:0)
-    body.push(0xF8); // [17] reserved | bitDepthLumaMinus8=0
-    body.push(0xF8); // [18] reserved | bitDepthChromaMinus8=0
+    body.push(0xFC | (chroma_format & 0x03)); // [16] reserved | chromaFormat
+    body.push(0xF8 | (bit_depth_luma_m8 & 0x07)); // [17] reserved | bitDepthLumaMinus8
+    body.push(0xF8 | (bit_depth_chroma_m8 & 0x07)); // [18] reserved | bitDepthChromaMinus8
     body.extend_from_slice(&[0, 0]); // [19-20] avgFrameRate=0
     body.push(0x0F); // [21] cfr=0 | numTemporalLayers=1 | tidNested=1 | lengthSizeMinusOne=3
     let arrays: [(u8, &[Vec<u8>]); 3] = [(32, vps), (33, sps), (34, pps)];

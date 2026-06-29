@@ -193,6 +193,14 @@ const NV_ENC_HEVC_PROFILE_MAIN_GUID: Guid = Guid {
     data4: [0x87, 0x8f, 0xf1, 0x25, 0x3b, 0x4d, 0xfd, 0xec],
 };
 
+// NV_ENC_HEVC_PROFILE_MAIN10_GUID — 4:2:0 10-bit Main 10 profile (Pascal+).
+const NV_ENC_HEVC_PROFILE_MAIN10_GUID: Guid = Guid {
+    data1: 0xfa4d2b6c,
+    data2: 0x3a5b,
+    data3: 0x411a,
+    data4: [0x80, 0x18, 0x0a, 0x3f, 0x5e, 0x3c, 0x9b, 0xe5],
+};
+
 /// The NVENC codec GUID for our `VideoCodec`.
 fn nvenc_codec_guid(codec: crate::frame::VideoCodec) -> Guid {
     use crate::frame::VideoCodec;
@@ -203,12 +211,18 @@ fn nvenc_codec_guid(codec: crate::frame::VideoCodec) -> Guid {
     }
 }
 
-/// The default profile GUID for H.264 / H.265. AV1 uses the preset's default
-/// profile (a zero GUID lets the driver autoselect).
-fn nvenc_profile_guid(codec: crate::frame::VideoCodec) -> Guid {
+/// The profile GUID for H.264 / H.265 at the given bit depth. AV1 uses the
+/// preset's default profile (a zero GUID lets the driver autoselect).
+///
+/// NVENC has **no H.264 High 10 profile** — H.264 10-bit (Hi10P) is not in the
+/// hardware, so 10-bit H.264 falls through to High (8-bit) and the
+/// `SUPPORT_10BIT_ENCODE` capability query rejects it before init. HEVC has a
+/// real Main 10 profile (Pascal+), so 10-bit H.265 selects it.
+fn nvenc_profile_guid(codec: crate::frame::VideoCodec, ten_bit: bool) -> Guid {
     use crate::frame::VideoCodec;
     match codec {
         VideoCodec::H264 => NV_ENC_H264_PROFILE_HIGH_GUID,
+        VideoCodec::H265 if ten_bit => NV_ENC_HEVC_PROFILE_MAIN10_GUID,
         VideoCodec::H265 => NV_ENC_HEVC_PROFILE_MAIN_GUID,
         VideoCodec::Av1 => Guid { data1: 0, data2: 0, data3: 0, data4: [0u8; 8] },
     }
@@ -511,7 +525,7 @@ struct NvEncConfigAv1 {
     film_grain_params: *mut c_void,
     num_fwd_refs: u32,
     num_bwd_refs: u32,
-    /// `NV_ENC_BIT_DEPTH_8 = 0`, `NV_ENC_BIT_DEPTH_10 = 1`.
+    /// `NV_ENC_BIT_DEPTH` enum — the literal bit depth (8 or 10).
     output_bit_depth: u32,
     input_bit_depth: u32,
     ltr_num_frames: u32,
@@ -520,6 +534,47 @@ struct NvEncConfigAv1 {
     reserved1: [u32; 230],
     reserved3: [*mut c_void; 62],
 }
+
+// `NV_ENC_BIT_DEPTH` enum values (nvEncodeAPI.h). The driver wants the literal
+// bit depth, not a 0/1 ordinal — both AV1 and HEVC config unions use this enum.
+const NV_ENC_BIT_DEPTH_8: u32 = 8;
+const NV_ENC_BIT_DEPTH_10: u32 = 10;
+
+/// Partial SDK-13 `NV_ENC_CONFIG_HEVC` view — only the leading fields up to
+/// `outputBitDepth` / `inputBitDepth` (offsets 200 / 204), overlaid on the
+/// codec-config union to set Main 10 bit depth without mirroring the whole
+/// struct. The nested `NV_ENC_CONFIG_HEVC_VUI_PARAMETERS` (= H.264 VUI, 28×u32
+/// = 112 bytes) sits between `maxTemporalLayersMinus1` and `ltrTrustMode`.
+#[repr(C)]
+struct NvEncConfigHevcBitDepth {
+    level: u32,
+    tier: u32,
+    min_cu_size: u32,
+    max_cu_size: u32,
+    flags: u32,
+    idr_period: u32,
+    intra_refresh_period: u32,
+    intra_refresh_cnt: u32,
+    max_num_ref_frames_in_dpb: u32,
+    ltr_num_frames: u32,
+    vps_id: u32,
+    sps_id: u32,
+    pps_id: u32,
+    slice_mode: u32,
+    slice_mode_data: u32,
+    max_temporal_layers_minus1: u32,
+    hevc_vui: [u32; 28],
+    ltr_trust_mode: u32,
+    use_b_frames_as_ref: u32,
+    num_ref_l0: u32,
+    num_ref_l1: u32,
+    tf_level: u32,
+    disable_deblocking_filter_idc: u32,
+    output_bit_depth: u32,
+    input_bit_depth: u32,
+}
+const _: () = assert!(std::mem::offset_of!(NvEncConfigHevcBitDepth, output_bit_depth) == 200);
+const _: () = assert!(std::mem::offset_of!(NvEncConfigHevcBitDepth, input_bit_depth) == 204);
 
 // Bitfield positions in NvEncConfigAv1.flags. Used by the override
 // block to set specific enable flags without bit-twiddling at the
@@ -1706,10 +1761,17 @@ impl NvencEncoder {
             // 2-bit field at bits 7-8).
             //
             // outputBitDepth / inputBitDepth replaced the old
-            // pixel_bit_depth_minus_8 fields. Enum: 8-bit = 0, 10-bit = 1.
+            // pixel_bit_depth_minus_8 fields. The `NV_ENC_BIT_DEPTH` enum is
+            // the *literal* bit depth: 8-bit = 8, 10-bit = 10 (NOT 0/1 — the
+            // driver rejects 0/1, which mis-sized the input surface and tripped
+            // `NvEncCreateInputBuffer` INVALID_PARAM on the first 10-bit run).
             let buffer_format = nvenc_buffer_format_for(config.pixel_format)?;
             let bit_depth_minus8 = pixel_bit_depth_minus8_for(config.pixel_format);
-            let bit_depth_enum = if bit_depth_minus8 == 0 { 0 } else { 1 };
+            let bit_depth_enum = if bit_depth_minus8 == 0 {
+                NV_ENC_BIT_DEPTH_8
+            } else {
+                NV_ENC_BIT_DEPTH_10
+            };
 
             if is_av1 {
                 // ─── AV1 codec-specific config (SDK 13 union view) ───────
@@ -1751,8 +1813,25 @@ impl NvencEncoder {
                 enc_config.rc_params.flags |= RC_FLAG_ZERO_REORDER_DELAY;
                 enc_config.rc_params.lookahead_depth = 0;
                 enc_config.rc_params.multi_pass = 0; // NV_ENC_MULTI_PASS_DISABLED
+
+                // H.265 Main 10: the encoder validates the input surface format
+                // against its configured inputBitDepth at NvEncCreateInputBuffer
+                // time, so a 10-bit buffer on the 8-bit-default preset config
+                // fails INVALID_PARAM. Overlay the SDK-13 NV_ENC_CONFIG_HEVC
+                // bit-depth fields (offsets 200/204) on the union and set them
+                // to 10. Only the two u32s are written — every preset-seeded
+                // field (level/tier/VUI/chroma) is left intact. H.264 has no
+                // 10-bit hardware path (capability-rejected upstream), so the
+                // poke is gated to H.265 — its layout differs from H.264's.
+                if config.codec == crate::frame::VideoCodec::H265 && bit_depth_minus8 != 0 {
+                    let hevc = &mut *(&mut enc_config.codec_config_av1 as *mut NvEncConfigAv1
+                        as *mut NvEncConfigHevcBitDepth);
+                    hevc.output_bit_depth = bit_depth_enum;
+                    hevc.input_bit_depth = bit_depth_enum;
+                }
                 tracing::info!(
                     codec = ?config.codec,
+                    ten_bit = bit_depth_minus8 != 0,
                     "NVENC H.264/H.265 using preset-seeded codec config (Annex-B, 1-in-1-out)"
                 );
             }
@@ -1761,7 +1840,7 @@ impl NvencEncoder {
             init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
             init_params.encode_guid = codec_guid;
             // Pin H.264 High / H.265 Main; AV1 keeps the preset's auto profile.
-            enc_config.profile_guid = nvenc_profile_guid(config.codec);
+            enc_config.profile_guid = nvenc_profile_guid(config.codec, bit_depth_minus8 != 0);
             init_params.preset_guid = preset_guid;
             init_params.encode_width = config.width;
             init_params.encode_height = config.height;
@@ -2112,34 +2191,26 @@ impl NvencEncoder {
                 }
             }
 
-            // U plane: starts at dst + pitch_bytes*h on the surface.
-            // Same half-pitch convention as the 8-bit IYUV path —
-            // chroma rows are HALF the luma row stride. See the 8-bit
-            // upload_frame for the 4K SIGSEGV diagnosis that fixed
-            // this. For 10-bit P010, both byte stride and sample
-            // stride are halved (chroma carries half the samples per
-            // row, each sample still 2 bytes).
-            let chroma_pitch_bytes = pitch_bytes / 2;
-            let u_dst_base = dst.add(pitch_bytes * h);
-            let u_src_base = src_ptr.add(y_bytes);
+            // UV plane: `NV_ENC_BUFFER_FORMAT_YUV420_10BIT` is **semi-planar**
+            // (P010-style) — a single interleaved chroma plane `U0 V0 U1 V1 …`,
+            // NOT separate U/V planes. It starts at dst + pitch_bytes*h and uses
+            // the FULL luma pitch stride (each chroma row packs cw U+V pairs =
+            // cw*2 samples = the same byte width as a luma row). Writing U and V
+            // as separate half-pitch planes (the planar IYUV layout) decodes as
+            // garbage chroma (Y PSNR fine, U/V ~6 dB). Source is planar
+            // Yuv420p10le, so de-interleave from separate U/V planes here.
+            let uv_dst_base = dst.add(pitch_bytes * h);
+            let u_src_base = src_ptr.add(y_bytes) as *const u16;
+            let v_src_base = src_ptr.add(y_bytes + uv_bytes) as *const u16;
             for row in 0..ch {
-                let src_row = u_src_base.add(row * cw * 2) as *const u16;
-                let dst_row = u_dst_base.add(row * chroma_pitch_bytes) as *mut u16;
+                let u_src_row = u_src_base.add(row * cw);
+                let v_src_row = v_src_base.add(row * cw);
+                let dst_row = uv_dst_base.add(row * pitch_bytes) as *mut u16;
                 for col in 0..cw {
-                    let sample = (*src_row.add(col)) & 0x03FF;
-                    *dst_row.add(col) = sample << 6;
-                }
-            }
-
-            // V plane: follows U at chroma_pitch_bytes*ch further in.
-            let v_dst_base = u_dst_base.add(chroma_pitch_bytes * ch);
-            let v_src_base = u_src_base.add(uv_bytes);
-            for row in 0..ch {
-                let src_row = v_src_base.add(row * cw * 2) as *const u16;
-                let dst_row = v_dst_base.add(row * chroma_pitch_bytes) as *mut u16;
-                for col in 0..cw {
-                    let sample = (*src_row.add(col)) & 0x03FF;
-                    *dst_row.add(col) = sample << 6;
+                    let u = (*u_src_row.add(col)) & 0x03FF;
+                    let v = (*v_src_row.add(col)) & 0x03FF;
+                    *dst_row.add(col * 2) = u << 6;
+                    *dst_row.add(col * 2 + 1) = v << 6;
                 }
             }
 
@@ -2805,9 +2876,13 @@ mod tests {
     #[test]
     fn test_nvenc_av1_config_10bit_hdr_layout() {
         let mut cfg: NvEncConfigAv1 = unsafe { std::mem::zeroed() };
-        // SDK 13 enum: 0 = NV_ENC_BIT_DEPTH_8, 1 = NV_ENC_BIT_DEPTH_10.
+        // SDK 13 NV_ENC_BIT_DEPTH enum is the literal depth: 8 and 10.
         let bit_depth_minus8 = pixel_bit_depth_minus8_for(PixelFormat::Yuv420p10le);
-        let bit_depth_enum: u32 = if bit_depth_minus8 == 0 { 0 } else { 1 };
+        let bit_depth_enum: u32 = if bit_depth_minus8 == 0 {
+            NV_ENC_BIT_DEPTH_8
+        } else {
+            NV_ENC_BIT_DEPTH_10
+        };
         cfg.output_bit_depth = bit_depth_enum;
         cfg.input_bit_depth = bit_depth_enum;
         cfg.flags |= AV1_CHROMA_FORMAT_IDC_420;
@@ -2826,8 +2901,8 @@ mod tests {
         cfg.matrix_coefficients = cm.matrix_coefficients as u32;
         cfg.color_range = cm.full_range as u32;
 
-        assert_eq!(cfg.output_bit_depth, 1, "10-bit enum value");
-        assert_eq!(cfg.input_bit_depth, 1, "10-bit input enum value");
+        assert_eq!(cfg.output_bit_depth, 10, "NV_ENC_BIT_DEPTH_10");
+        assert_eq!(cfg.input_bit_depth, 10, "NV_ENC_BIT_DEPTH_10 input");
         assert_eq!(cfg.color_primaries, 9, "BT.2020");
         assert_eq!(cfg.transfer_characteristics, 16, "ST 2084 / PQ");
         assert_eq!(cfg.matrix_coefficients, 9, "BT.2020 NCL");
@@ -2849,8 +2924,8 @@ mod tests {
         let bd_offset = std::mem::offset_of!(NvEncConfigAv1, output_bit_depth);
         assert_eq!(
             u32::from_le_bytes(bytes[bd_offset..bd_offset + 4].try_into().unwrap()),
-            1,
-            "output_bit_depth must read back as 1 (10-bit) from raw bytes"
+            10,
+            "output_bit_depth must read back as 10 (NV_ENC_BIT_DEPTH_10) from raw bytes"
         );
 
         let prim_offset = std::mem::offset_of!(NvEncConfigAv1, color_primaries);
@@ -2881,7 +2956,11 @@ mod tests {
     fn test_nvenc_av1_config_8bit_sdr_layout() {
         let mut cfg: NvEncConfigAv1 = unsafe { std::mem::zeroed() };
         let bit_depth_minus8 = pixel_bit_depth_minus8_for(PixelFormat::Yuv420p);
-        let bit_depth_enum: u32 = if bit_depth_minus8 == 0 { 0 } else { 1 };
+        let bit_depth_enum: u32 = if bit_depth_minus8 == 0 {
+            NV_ENC_BIT_DEPTH_8
+        } else {
+            NV_ENC_BIT_DEPTH_10
+        };
         cfg.output_bit_depth = bit_depth_enum;
         cfg.input_bit_depth = bit_depth_enum;
         cfg.flags |= AV1_CHROMA_FORMAT_IDC_420;
@@ -2891,7 +2970,7 @@ mod tests {
         cfg.matrix_coefficients = cm.matrix_coefficients as u32;
         cfg.color_range = cm.full_range as u32;
 
-        assert_eq!(cfg.output_bit_depth, 0, "8-bit enum value");
+        assert_eq!(cfg.output_bit_depth, 8, "NV_ENC_BIT_DEPTH_8");
         assert_eq!(cfg.color_primaries, 1, "BT.709 default");
         assert_eq!(cfg.transfer_characteristics, 1, "BT.709 default");
         assert_eq!(cfg.matrix_coefficients, 1, "BT.709 default");

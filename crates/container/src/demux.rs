@@ -3538,17 +3538,30 @@ pub(crate) fn demux_mp4_streaming_init(data: &[u8]) -> Result<Mp4StreamingDemuxe
         (Vec::new(), 4u8)
     };
 
-    // Pixel format detection requires the first sample's bitstream.
-    // Pull just that one sample (without consuming the streaming
-    // cursor) via a temporary reader, then refine info.pixel_format
-    // before handing the StreamInfo to the caller.
+    // Pixel-format detection needs the SPS / sequence header. For hvc1 / avc1
+    // the parameter sets live in the sample entry (`sps_pps`), NOT the first
+    // VCL sample — detecting on the raw sample alone silently reports 8-bit for
+    // a 10-bit Main 10 / Hi10P source, which then mis-sizes the encoder. Detect
+    // on the parameter sets (Annex-B) when present; fall back to the first
+    // sample for hev1 / avc3 (in-band) and AV1 / VP9 (sequence header in band).
     if sample_count > 0 {
-        let mut probe_for_pf = Mp4Reader::read_header(Cursor::new(owned.as_slice()), size)
-            .context("re-reading MP4 for pixel-format probe")?;
-        if let Ok(Some(s)) = probe_for_pf.read_sample(track_id, 1) {
-            let first_sample = s.bytes.to_vec();
-            let detected_pf = codec::pixel_format::detect(&codec, &[first_sample]);
-            info.pixel_format = detected_pf;
+        let detect_input: Vec<u8> = if !sps_pps.is_empty() {
+            let mut buf = Vec::new();
+            for ps in &sps_pps {
+                buf.extend_from_slice(&[0, 0, 0, 1]);
+                buf.extend_from_slice(ps);
+            }
+            buf
+        } else {
+            let mut probe_for_pf = Mp4Reader::read_header(Cursor::new(owned.as_slice()), size)
+                .context("re-reading MP4 for pixel-format probe")?;
+            match probe_for_pf.read_sample(track_id, 1) {
+                Ok(Some(s)) => s.bytes.to_vec(),
+                _ => Vec::new(),
+            }
+        };
+        if !detect_input.is_empty() {
+            info.pixel_format = codec::pixel_format::detect(&codec, &[detect_input]);
         }
     }
 
