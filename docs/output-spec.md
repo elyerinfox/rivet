@@ -221,7 +221,7 @@ spec.with_filters(vec![
 spec.with_filters(codec::filter::parse_chain("crop=1920:1080,overlay=logo.png:24:24")?);
 ```
 
-See **[Video filters](filters.md)** for the full filter set, the string +
+See **[Video filters](filters/README.md)** for the full filter set, the string +
 structured-object forms, and per-surface usage.
 
 ---

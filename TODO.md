@@ -104,7 +104,7 @@ The spatial denoise family is implemented (`codec::filter`, `denoise=METHOD:STRE
 **bilateral, gaussian, median, mean, nlmeans, anisotropic** — selectable, 8-bit,
 unit-tested + verified end-to-end (720p, 30 fps): mean/gaussian ≈ baseline,
 median/bilateral fast, anisotropic ~0.09 s/frame, nlmeans ~0.84 s/frame
-(offline-only). See [docs/filters.md](docs/filters.md#denoise).
+(offline-only). See [docs/filters/denoise.md](docs/filters/denoise.md).
 
 Follow-ups:
 - [ ] **Deep denoise — DPIR** ([cszn/DPIR](https://github.com/cszn/DPIR), DRUNet):
@@ -118,3 +118,23 @@ Follow-ups:
       history, which the stateless `Arc<FilterChain>` doesn't carry today.
 - [ ] **AVX2 denoise kernels** — the bilateral / nlmeans inner loops are the
       perf-sensitive ones; mirror the existing AVX2 colorspace/scale dispatch.
+
+---
+
+## Codebase modularization (one-thing-per-file)
+
+The video filters are now the exemplar of the paradigm: `codec::filter` is a
+directory with **one file per filter** (`crop.rs`, `pad.rs`, …, `denoise/` with a
+file per algorithm) + a thin `mod.rs` (enum, parser, dispatch, shared helpers).
+Per-filter docs mirror it under [docs/filters/](docs/filters/). See
+[`crates/codec/src/filter/`](crates/codec/src/filter/).
+
+Apply the same split to the remaining large files — each is its own focused
+refactor (split + verify, no behaviour change), tackled incrementally to avoid
+destabilizing the whole tree at once:
+
+- [ ] `container/src/mux.rs` (~4.6k) → one file per box writer / track.
+- [ ] `container/src/demux.rs` (~4.3k) → per-container demuxer modules.
+- [ ] `codec/src/pixel_format.rs` (~4.3k) → per-codec bitstream parsers.
+- [ ] `codec/src/encode/{nvenc,amf,qsv}.rs`, `container/src/{ts,cmaf,avi}.rs`,
+      `codec/src/colorspace.rs`, `decode/nvdec.rs` — same treatment.

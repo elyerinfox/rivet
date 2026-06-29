@@ -117,7 +117,7 @@ Done once in the pump, before fanout, because it's identical for every rung:
   says so. The default `TonemapToSdr` maps PQ/HLG BT.2020 down to 8-bit BT.709
   (`codec::tonemap` + `colorspace::convert_to_sdr_bt709`); `Passthrough`/`Hdr10`/
   `Hlg` keep it. The pump never tonemaps on its own — it's policy-driven.
-- **Video filters** — the spec's [filter chain](filters.md) (crop / pad / flip /
+- **Video filters** — the spec's [filter chain](filters/README.md) (crop / pad / flip /
   rotate / grayscale / image overlay / colour), applied last so every rung sees
   the transformed source. Overlay images are loaded once when the chain is prepared.
 
