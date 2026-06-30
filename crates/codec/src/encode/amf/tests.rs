@@ -44,9 +44,8 @@ use super::{
     submit_with_backpressure,
     // re-exported crate items (brought into amf via private `use`)
     ColorMetadata,
-    PixelFormat,
-    TransferFn,
 };
+use crate::frame::{PixelFormat, TransferFn};
 use super::tuning::AmfQualityPreset;
 use super::*;
 

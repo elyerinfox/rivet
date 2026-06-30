@@ -267,8 +267,8 @@ pub(super) struct AmfContextObj {
 
 #[repr(C)]
 pub(super) struct AmfComponentVtbl {
-    query_interface: QueryInterfaceFn,
-    acquire: AcquireFn,
+    pub(super) query_interface: QueryInterfaceFn,
+    pub(super) acquire: AcquireFn,
     pub(super) release: ReleaseFn,
     // SetProperty / GetProperty take the variant by value; the AMF C ABI
     // passes it as an inline 32-byte struct, so `by value` matches the
