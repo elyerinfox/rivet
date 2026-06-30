@@ -1,0 +1,508 @@
+//! The transcode job engine.
+//!
+//! [`run_job`] takes an input buffer and an [`OutputSpec`] and drives the
+//! whole pipeline: demux → shared decode pump (decode once) → fan out to per-
+//! rung work → assemble the requested output mode. Progress is streamed
+//! through a [`ProgressSink`] as a uniform [`RungProgress`] per rung.
+//!
+//! - **SingleFile** mode: the decode pump fans frames to one per-rung worker
+//!   that scales + encodes + muxes a self-contained MP4.
+//! - **Hls** mode: the [`crate::multigpu`] orchestrator decodes once and
+//!   schedules every rung's CMAF segments across all GPUs (fair lease pool +
+//!   mid-flight helper dispatch + cross-vendor codec invariant), then this
+//!   module assembles the HLS package (audio rendition + playlists).
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use bytes::Bytes;
+
+use codec::encode::EncoderConfig;
+use container::streaming::{self, DemuxHeader};
+
+use crate::decode_pump::{ClipSource, DecodePumpConfig};
+use crate::multigpu;
+use crate::progress::{JobEvent, ProgressSink, RungProgress, RungStatus};
+use crate::spec::{OutputMode, OutputSpec, Rung};
+use crate::validate::needs_chroma_downsample;
+
+mod audio;
+mod pump;
+mod run;
+mod splice;
+#[cfg(test)]
+mod tests;
+
+pub use splice::Clip;
+
+use self::audio::{PreparedAudio, prepare_audio};
+use self::pump::run_hls;
+use self::run::{run_serial_single_file, run_single_file};
+use self::splice::{trim_audio, trim_frame};
+
+/// Bounded per-rung frame channel — backpressures the decode pump.
+pub(super) const FRAME_CHANNEL_CAPACITY: usize = 8;
+
+/// The artifact one rung produced.
+#[derive(Debug)]
+pub enum RungArtifact {
+    /// A single self-contained file (MP4 bytes).
+    File(Vec<u8>),
+    /// An HLS rendition: a directory of CMAF segments + a media playlist.
+    HlsRendition {
+        dir: PathBuf,
+        relative_dir: String,
+    },
+}
+
+/// Result for one completed rung.
+#[derive(Debug)]
+pub struct RungOutput {
+    pub label: String,
+    pub width: u32,
+    pub height: u32,
+    pub frames: u64,
+    pub bytes: u64,
+    pub artifact: RungArtifact,
+}
+
+/// The full job result.
+#[derive(Debug)]
+pub struct JobOutput {
+    /// One entry per rung that completed successfully (failed rungs are
+    /// reported via the progress sink with [`RungStatus::Failed`]).
+    pub rungs: Vec<RungOutput>,
+    /// HLS mode only: the asset root directory.
+    pub hls_root: Option<PathBuf>,
+    /// HLS mode only: path to the master playlist.
+    pub master_playlist: Option<PathBuf>,
+    pub source_codec: String,
+    pub source_dims: (u32, u32),
+    pub source_frame_rate: f64,
+    /// How the audio was handled.
+    pub audio_handling: String,
+    pub elapsed: Duration,
+}
+
+/// Run a transcode job. Async — call from within a Tokio runtime.
+///
+/// For [`OutputMode::Hls`], `output_dir` is the asset root the HLS package is
+/// written under; `None` uses a fresh temp directory (returned in
+/// [`JobOutput::hls_root`]). For [`OutputMode::SingleFile`] `output_dir` is
+/// ignored (bytes are returned).
+pub async fn run_job(
+    input: Bytes,
+    spec: &OutputSpec,
+    output_dir: Option<&Path>,
+    sink: Arc<dyn ProgressSink>,
+) -> Result<JobOutput> {
+    let started = Instant::now();
+    spec.validate().context("invalid OutputSpec")?;
+
+    let (header, audio_track) = {
+        let demuxer = streaming::demux_streaming(&input).context("demux")?;
+        (demuxer.header().clone(), demuxer.audio().cloned())
+    };
+    let source_codec = header.codec.to_ascii_lowercase();
+    let source_dims = (header.info.width, header.info.height);
+    let source_frame_rate = header.info.frame_rate;
+
+    // `DecodePolicy::FastestGpu`: benchmark each decode-capable GPU on a short
+    // prefix of the input and resolve the policy to `SpecificGpu(fastest)`.
+    // A no-op when fewer than two candidates exist (nothing to choose). Rebinds
+    // `spec` to a clone carrying the resolved policy; everything downstream
+    // reads `spec.decode_policy.gpu_index()`.
+    let resolved_spec;
+    let spec = if spec.decode_policy.is_fastest() {
+        let candidates = codec::decode::decode_capable_gpu_indices(&source_codec);
+        if candidates.len() > 1 {
+            match crate::decode_pump::fastest_decode_gpu(
+                &source_codec,
+                &header.info,
+                &input,
+                &candidates,
+                crate::decode_pump::DECODE_BENCH_FRAMES,
+            ) {
+                Some(gpu) => {
+                    let mut s = spec.clone();
+                    s.decode_policy = crate::spec::DecodePolicy::SpecificGpu(gpu);
+                    resolved_spec = s;
+                    &resolved_spec
+                }
+                None => spec,
+            }
+        } else {
+            tracing::info!(
+                candidates = candidates.len(),
+                "decode-with-fastest: fewer than two decode-capable GPUs; nothing to benchmark"
+            );
+            spec
+        }
+    } else {
+        spec
+    };
+
+    sink.on_event(JobEvent::Started { rungs: spec.rungs.len() });
+    sink.on_event(JobEvent::Probed {
+        codec: source_codec.clone(),
+        width: header.info.width,
+        height: header.info.height,
+        frame_rate: header.info.frame_rate,
+        audio_codec: audio_track.as_ref().map(|t| t.codec.to_ascii_lowercase()),
+    });
+
+    let frame_rate = {
+        let mut fr = if header.info.frame_rate > 0.0 { header.info.frame_rate } else { 30.0 };
+        if let Some(cap) = spec.max_frame_rate {
+            fr = fr.min(cap);
+        }
+        fr
+    };
+    let frames_total = if header.info.total_frames > 0 {
+        Some(header.info.total_frames)
+    } else {
+        None
+    };
+
+    let prepared_audio = prepare_audio(audio_track.as_ref(), spec.audio).context("preparing audio")?;
+    let audio_handling = prepared_audio
+        .as_ref()
+        .map(|a| a.handling.clone())
+        .unwrap_or_else(|| "none".to_string());
+
+    // Prepare the video filter chain once (loads any overlay images), then share
+    // the Arc with every decode pump / multi-GPU param built below.
+    let filter_chain = Arc::new(
+        codec::filter::FilterChain::prepare(&spec.filters).context("preparing video filters")?,
+    );
+
+    let (rungs, hls_root, master_playlist) = match &spec.mode {
+        OutputMode::SingleFile => {
+            let rungs = run_single_file(
+                input.clone(),
+                spec,
+                &header,
+                frame_rate,
+                frames_total,
+                prepared_audio.as_ref(),
+                Arc::clone(&filter_chain),
+                Arc::clone(&sink),
+            )
+            .await?;
+            (rungs, None, None)
+        }
+        OutputMode::Hls { segment_seconds } => {
+            run_hls(
+                input.clone(),
+                spec,
+                *segment_seconds,
+                &header,
+                frame_rate,
+                prepared_audio.as_ref(),
+                Arc::clone(&filter_chain),
+                output_dir,
+                Arc::clone(&sink),
+                // Single input: run_hls builds the (optionally trimmed) plan
+                // from spec.trim itself.
+                Vec::new(),
+                None,
+            )
+            .await?
+        }
+    };
+
+    let completed = rungs.len();
+    sink.on_event(JobEvent::Finished {
+        rungs_completed: completed,
+        rungs_failed: spec.rungs.len().saturating_sub(completed),
+    });
+
+    Ok(JobOutput {
+        rungs,
+        hls_root,
+        master_playlist,
+        source_codec,
+        source_dims,
+        source_frame_rate,
+        audio_handling,
+        elapsed: started.elapsed(),
+    })
+}
+
+/// Synchronous wrapper that builds a multi-threaded Tokio runtime.
+pub fn run_job_blocking(
+    input: &[u8],
+    spec: &OutputSpec,
+    output_dir: Option<&Path>,
+    sink: Arc<dyn ProgressSink>,
+) -> Result<JobOutput> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building Tokio runtime")?;
+    rt.block_on(run_job(Bytes::copy_from_slice(input), spec, output_dir, sink))
+}
+
+/// **Splice**: concatenate (and per-clip trim) one or more inputs into a single
+/// continuous, re-encoded MP4 per rung. Each clip is decoded with its own
+/// decoder, trimmed to its `[start, end)`, and the kept frames are fed to the
+/// shared encoder back-to-back. Because the muxer numbers output frames by
+/// count, the join is gap-free and the timeline is zero-based — no PTS
+/// rewriting. Audio is trimmed per clip and concatenated to match.
+///
+/// Output config (frame rate, color) follows the **first** clip; inputs are
+/// re-encoded to the spec's uniform output, so they may differ in codec /
+/// resolution / color. A one-clip `Vec` is a plain (optionally trimmed)
+/// transcode. Honors the spec's [`OutputMode`]: `SingleFile` writes one MP4 per
+/// rung; `Hls` writes a CMAF/HLS package (the spliced frame stream feeds the
+/// multi-GPU HLS engine, so segments are keyframe-aligned across the join).
+pub async fn run_splice_job(
+    clips: Vec<Clip>,
+    spec: &OutputSpec,
+    output_dir: Option<&Path>,
+    sink: Arc<dyn ProgressSink>,
+) -> Result<JobOutput> {
+    let started = Instant::now();
+    spec.validate().context("invalid OutputSpec")?;
+    if clips.is_empty() {
+        bail!("splice requires at least one clip");
+    }
+
+    // Probe each clip + prepare its audio. The first clip drives output config.
+    struct ClipPrep {
+        header: DemuxHeader,
+        audio: Option<PreparedAudio>,
+        src_audio_codec: Option<String>,
+    }
+    let mut preps = Vec::with_capacity(clips.len());
+    for (i, clip) in clips.iter().enumerate() {
+        let demuxer = streaming::demux_streaming(&clip.input)
+            .with_context(|| format!("demuxing splice clip {i}"))?;
+        let header = demuxer.header().clone();
+        let src_audio_codec = demuxer.audio().map(|t| t.codec.to_ascii_lowercase());
+        let audio = prepare_audio(demuxer.audio(), spec.audio)
+            .with_context(|| format!("preparing audio for splice clip {i}"))?;
+        preps.push(ClipPrep { header, audio, src_audio_codec });
+    }
+
+    let primary = preps[0].header.clone();
+    let source_codec = primary.codec.to_ascii_lowercase();
+    let source_dims = (primary.info.width, primary.info.height);
+    let source_frame_rate = primary.info.frame_rate;
+    let frame_rate = {
+        let mut fr = if primary.info.frame_rate > 0.0 { primary.info.frame_rate } else { 30.0 };
+        if let Some(cap) = spec.max_frame_rate {
+            fr = fr.min(cap);
+        }
+        fr
+    };
+
+    sink.on_event(JobEvent::Started { rungs: spec.rungs.len() });
+    sink.on_event(JobEvent::Probed {
+        codec: source_codec.clone(),
+        width: primary.info.width,
+        height: primary.info.height,
+        frame_rate: primary.info.frame_rate,
+        audio_codec: preps[0].src_audio_codec.clone(),
+    });
+
+    // Concat re-encodes every clip to one uniform output that follows the FIRST
+    // clip. Resolution differences are handled (each frame is scaled to the
+    // rung), but frame rate is NOT converted — a clip with a different fps keeps
+    // its frames and is timed at the output rate, which shifts its playback
+    // speed. Warn so the operator can pre-normalise fps if that matters.
+    for (i, prep) in preps.iter().enumerate().skip(1) {
+        let dims = (prep.header.info.width, prep.header.info.height);
+        let fps = prep.header.info.frame_rate;
+        let fps_differs = fps > 0.0
+            && primary.info.frame_rate > 0.0
+            && (fps - primary.info.frame_rate).abs() > 0.5;
+        if dims != source_dims || fps_differs {
+            tracing::warn!(
+                clip_index = i,
+                clip = %format!("{}x{} @ {:.3} fps", dims.0, dims.1, fps),
+                output = %format!(
+                    "{}x{} @ {:.3} fps",
+                    source_dims.0, source_dims.1, primary.info.frame_rate
+                ),
+                fps_differs,
+                "splice clip differs from the first clip: resolution is scaled to \
+                 the output; frame rate is NOT converted (a differing fps shifts \
+                 this clip's timing)"
+            );
+        }
+    }
+
+    let filter_chain = Arc::new(
+        codec::filter::FilterChain::prepare(&spec.filters).context("preparing video filters")?,
+    );
+    let encode_gpu = multigpu::serial_gpu_for_policy(spec.encode_policy);
+    // `--decode-with-fastest`: benchmark decode-capable GPUs on the first clip
+    // and prefer the quickest for the pump (the same decode GPU is used for
+    // every clip). Falls through to the explicit override / policy GPU.
+    let fastest_decode = if spec.decode_policy.is_fastest() {
+        let candidates = codec::decode::decode_capable_gpu_indices(&primary.codec);
+        if candidates.len() > 1 {
+            crate::decode_pump::fastest_decode_gpu(
+                &primary.codec,
+                &primary.info,
+                &clips[0].input,
+                &candidates,
+                crate::decode_pump::DECODE_BENCH_FRAMES,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let decode_gpu = spec.decode_policy.gpu_index().or(fastest_decode).or(encode_gpu);
+    let (output_color_metadata, output_pixel_format) =
+        spec.resolve_output(primary.info.color_metadata, primary.info.pixel_format);
+    let base_cfg = EncoderConfig {
+        frame_rate,
+        pixel_format: output_pixel_format,
+        color_metadata: output_color_metadata,
+        gpu_index: encode_gpu,
+        codec: spec.video_codec.codec(),
+        ..EncoderConfig::default()
+    };
+
+    // One decode source per clip (own decoder cfg + trim range); concatenate the
+    // trimmed audio and sum the expected frame total across clips.
+    let mut clip_sources = Vec::with_capacity(clips.len());
+    let mut combined_audio: Option<PreparedAudio> = None;
+    let mut effective_total: u64 = 0;
+    let mut total_known = true;
+    for (clip, prep) in clips.iter().zip(preps.iter()) {
+        let cfps = if prep.header.info.frame_rate > 0.0 {
+            prep.header.info.frame_rate
+        } else {
+            frame_rate
+        };
+        let start_frame = trim_frame(clip.start, cfps).unwrap_or(0);
+        let end_frame = trim_frame(clip.end, cfps);
+        match end_frame {
+            Some(e) => effective_total += e.saturating_sub(start_frame),
+            None if prep.header.info.total_frames > 0 => {
+                effective_total += prep.header.info.total_frames.saturating_sub(start_frame)
+            }
+            None => total_known = false,
+        }
+        if let Some(a) = trim_audio(prep.audio.as_ref(), clip.start, clip.end) {
+            if let Some(c) = combined_audio.as_mut() {
+                c.extend(&a);
+            } else {
+                combined_audio = Some(a);
+            }
+        }
+        let pump_cfg = DecodePumpConfig {
+            codec_name: prep.header.codec.clone(),
+            info_for_decoder: prep.header.info.clone(),
+            source_color_metadata: prep.header.info.color_metadata,
+            source_pixel_format: prep.header.info.pixel_format,
+            needs_downsample: needs_chroma_downsample(prep.header.info.pixel_format),
+            tonemap_to_sdr: spec.tonemaps(),
+            gpu_index: decode_gpu,
+            filters: Arc::clone(&filter_chain),
+        };
+        clip_sources.push(ClipSource {
+            cfg: pump_cfg,
+            input: clip.input.clone(),
+            start_frame,
+            end_frame,
+        });
+    }
+    let effective_total = total_known.then_some(effective_total);
+    let audio_handling = combined_audio
+        .as_ref()
+        .map(|a| a.handling.clone())
+        .unwrap_or_else(|| "none".to_string());
+
+    let (rungs, hls_root, master_playlist) = match &spec.mode {
+        OutputMode::SingleFile => {
+            let rungs = run_serial_single_file(
+                clip_sources,
+                spec,
+                base_cfg,
+                frame_rate,
+                effective_total,
+                combined_audio,
+                Arc::clone(&sink),
+            )
+            .await?;
+            (rungs, None, None)
+        }
+        OutputMode::Hls { segment_seconds } => {
+            // Concat through the multi-GPU HLS engine: the spliced pump feeds the
+            // joined frame stream, segments form at keyframe boundaries on the
+            // output timeline, so the join is segment-aligned like any ladder.
+            run_hls(
+                clips[0].input.clone(),
+                spec,
+                *segment_seconds,
+                &primary,
+                frame_rate,
+                combined_audio.as_ref(),
+                Arc::clone(&filter_chain),
+                output_dir,
+                Arc::clone(&sink),
+                clip_sources,
+                effective_total,
+            )
+            .await?
+        }
+    };
+
+    let completed = rungs.len();
+    sink.on_event(JobEvent::Finished {
+        rungs_completed: completed,
+        rungs_failed: spec.rungs.len().saturating_sub(completed),
+    });
+    Ok(JobOutput {
+        rungs,
+        hls_root,
+        master_playlist,
+        source_codec,
+        source_dims,
+        source_frame_rate,
+        audio_handling,
+        elapsed: started.elapsed(),
+    })
+}
+
+/// Blocking wrapper for [`run_splice_job`].
+pub fn run_splice_job_blocking(
+    clips: Vec<Clip>,
+    spec: &OutputSpec,
+    output_dir: Option<&Path>,
+    sink: Arc<dyn ProgressSink>,
+) -> Result<JobOutput> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building Tokio runtime")?;
+    rt.block_on(run_splice_job(clips, spec, output_dir, sink))
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers used across submodules
+// ---------------------------------------------------------------------------
+
+pub(super) fn report_failed(sink: &dyn ProgressSink, rung_index: usize, rung: &Rung, message: &str) {
+    sink.on_rung(RungProgress {
+        rung_index,
+        label: rung.label.clone(),
+        width: rung.width,
+        height: rung.height,
+        status: RungStatus::Failed,
+        percent: 0.0,
+        frames_done: 0,
+        frames_total: None,
+        segments_written: 0,
+        bytes_out: 0,
+        message: Some(message.to_string()),
+    });
+}

@@ -233,7 +233,7 @@ fn structured_pattern_round_trip_recovers_frame_indices() {
     // push_sample with decode_next so dav1d can yield pictures incrementally.
     // dav1d_flush inside finish() wipes any queued pictures, so we MUST
     // drain before finish.
-    let mut drain = |decoder: &mut Box<dyn Decoder>,
+    let drain = |decoder: &mut Box<dyn Decoder>,
                      recovered: &mut Vec<u32>,
                      total_confident: &mut u32,
                      total_bits: &mut u32| {
