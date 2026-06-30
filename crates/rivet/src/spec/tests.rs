@@ -1,0 +1,187 @@
+use super::*;
+use super::hdr_metadata;
+use codec::encode::EncoderConfig;
+use codec::frame::{PixelFormat, TransferFn};
+
+#[test]
+fn decode_policy_parses_and_resolves() {
+    // `--decode-gpu` value space.
+    assert_eq!("auto".parse::<DecodePolicy>().unwrap(), DecodePolicy::Auto);
+    assert_eq!("".parse::<DecodePolicy>().unwrap(), DecodePolicy::Auto);
+    assert_eq!("AUTO".parse::<DecodePolicy>().unwrap(), DecodePolicy::Auto);
+    assert_eq!("fastest".parse::<DecodePolicy>().unwrap(), DecodePolicy::FastestGpu);
+    assert_eq!(" Fastest ".parse::<DecodePolicy>().unwrap(), DecodePolicy::FastestGpu);
+    assert_eq!("2".parse::<DecodePolicy>().unwrap(), DecodePolicy::SpecificGpu(2));
+    assert!("bogus".parse::<DecodePolicy>().is_err());
+    // Resolution to a concrete pin (Auto / unresolved Fastest ⇒ None).
+    assert_eq!(DecodePolicy::Auto.gpu_index(), None);
+    assert_eq!(DecodePolicy::FastestGpu.gpu_index(), None);
+    assert_eq!(DecodePolicy::SpecificGpu(3).gpu_index(), Some(3));
+    assert!(DecodePolicy::FastestGpu.is_fastest());
+    assert!(!DecodePolicy::SpecificGpu(0).is_fastest());
+    assert_eq!(DecodePolicy::default(), DecodePolicy::Auto);
+}
+
+#[test]
+fn single_file_sets_coherent_fields() {
+    let s = OutputSpec::single_file(vec![Rung::new(1280, 720)]);
+    assert_eq!(s.mode, OutputMode::SingleFile);
+    assert_eq!(s.container, Container::Mp4);
+    assert_eq!(s.muxer, Muxer::Mp4File);
+    assert!(s.validate().is_ok());
+}
+
+#[test]
+fn encode_policy_defaults_to_all_gpus() {
+    let s = OutputSpec::single_file(vec![Rung::new(640, 360)]);
+    assert_eq!(s.encode_policy, EncodePolicy::AllGpus);
+    assert_eq!(s.gpu_index, None);
+}
+
+#[test]
+fn chunk_seam_mode_defaults_parallel_and_builder_sets_it() {
+    let s = OutputSpec::single_file(vec![Rung::new(640, 360)]);
+    assert_eq!(s.chunk_seam_mode, ChunkSeamMode::Parallel);
+    let s = s.chunk_seam_mode(ChunkSeamMode::Serial);
+    assert_eq!(s.chunk_seam_mode, ChunkSeamMode::Serial);
+    let s = OutputSpec::single_file(vec![Rung::new(640, 360)])
+        .chunk_seam_mode(ChunkSeamMode::ParallelConstQp);
+    assert_eq!(s.chunk_seam_mode, ChunkSeamMode::ParallelConstQp);
+    assert!(s.validate().is_ok());
+}
+
+#[test]
+fn encode_policy_single_gpu_syncs_gpu_index() {
+    let s = OutputSpec::single_file(vec![Rung::new(640, 360)])
+        .encode_policy(EncodePolicy::SingleGpu(Some(2)));
+    assert_eq!(s.encode_policy, EncodePolicy::SingleGpu(Some(2)));
+    assert_eq!(s.gpu_index, Some(2));
+}
+
+#[test]
+fn with_gpu_index_implies_single_gpu_policy() {
+    let s = OutputSpec::single_file(vec![Rung::new(640, 360)]).with_gpu_index(1);
+    assert_eq!(s.encode_policy, EncodePolicy::SingleGpu(Some(1)));
+    assert_eq!(s.gpu_index, Some(1));
+}
+
+#[test]
+fn encode_policy_family_does_not_pin_gpu_index() {
+    let s = OutputSpec::single_file(vec![Rung::new(640, 360)])
+        .encode_policy(EncodePolicy::Family(GpuFamily::Nvidia));
+    assert_eq!(s.encode_policy, EncodePolicy::Family(GpuFamily::Nvidia));
+    // Family is multi-GPU within a vendor — no single-GPU pin.
+    assert_eq!(s.gpu_index, None);
+}
+
+#[test]
+fn decode_policy_defaults_to_auto_and_is_settable() {
+    let s = OutputSpec::single_file(vec![Rung::new(640, 360)]);
+    assert_eq!(s.decode_policy, DecodePolicy::Auto);
+    let s = s.decode_policy(DecodePolicy::SpecificGpu(0));
+    assert_eq!(s.decode_policy, DecodePolicy::SpecificGpu(0));
+    // decode_policy is independent of the encode policy.
+    assert_eq!(s.encode_policy, EncodePolicy::AllGpus);
+}
+
+#[test]
+fn encode_policy_all_gpus_leaves_gpu_index_untouched() {
+    let s = OutputSpec::single_file(vec![Rung::new(640, 360)])
+        .with_gpu_index(3)
+        .encode_policy(EncodePolicy::AllGpus);
+    // AllGpus doesn't clear an explicit pin; it just won't single-pin.
+    assert_eq!(s.encode_policy, EncodePolicy::AllGpus);
+    assert_eq!(s.gpu_index, Some(3));
+}
+
+#[test]
+fn hls_sets_coherent_fields() {
+    let s = OutputSpec::hls(vec![Rung::new(1920, 1080), Rung::new(640, 360)], 4.0);
+    assert!(matches!(s.mode, OutputMode::Hls { .. }));
+    assert_eq!(s.container, Container::Cmaf);
+    assert_eq!(s.muxer, Muxer::CmafHls);
+    assert!(s.validate().is_ok());
+}
+
+#[test]
+fn validate_rejects_empty_rungs() {
+    assert!(OutputSpec::single_file(vec![]).validate().is_err());
+}
+
+#[test]
+fn validate_rejects_odd_dimensions() {
+    assert!(OutputSpec::single_file(vec![Rung::new(1281, 720)]).validate().is_err());
+}
+
+#[test]
+fn validate_rejects_incoherent_mode_muxer() {
+    let mut s = OutputSpec::single_file(vec![Rung::new(640, 360)]);
+    s.muxer = Muxer::CmafHls; // mismatched with SingleFile mode
+    assert!(s.validate().is_err());
+}
+
+#[test]
+fn rung_label_uses_short_side() {
+    assert_eq!(Rung::new(1920, 1080).label, "1080p");
+    assert_eq!(Rung::new(1080, 1920).label, "1080p");
+    assert_eq!(Rung::new(640, 360).short_side(), 360);
+}
+
+#[test]
+fn color_and_pixel_format_default_to_sdr_8bit() {
+    let s = OutputSpec::single_file(vec![Rung::new(640, 360)]);
+    assert_eq!(s.color, ColorPolicy::TonemapToSdr);
+    assert_eq!(s.bit_depth, BitDepth::Auto);
+    assert!(s.tonemaps());
+    assert!(s.validate().is_ok());
+}
+
+#[test]
+fn resolve_output_default_folds_hdr_source_to_sdr_8bit() {
+    let s = OutputSpec::single_file(vec![Rung::new(640, 360)]);
+    let hdr_src = hdr_metadata(TransferFn::St2084);
+    let (color, pix) = s.resolve_output(hdr_src, PixelFormat::Yuv420p10le);
+    // Default TonemapToSdr collapses an HDR 10-bit source to 8-bit SDR.
+    assert_eq!(color.transfer, TransferFn::Bt709);
+    assert_eq!(pix, PixelFormat::Yuv420p);
+}
+
+#[test]
+fn resolve_output_passthrough_keeps_source() {
+    let s = OutputSpec::single_file(vec![Rung::new(640, 360)]).with_color(ColorPolicy::Passthrough);
+    assert!(!s.tonemaps());
+    let src = hdr_metadata(TransferFn::St2084);
+    let (color, pix) = s.resolve_output(src, PixelFormat::Yuv420p10le);
+    assert_eq!(color.transfer, TransferFn::St2084);
+    assert_eq!(pix, PixelFormat::Yuv420p10le);
+}
+
+#[test]
+fn validate_rejects_hdr_without_10bit_or_ffmpeg() {
+    // HDR10 implies 10-bit; without the `ffmpeg` feature the build is 8-bit,
+    // so validation must reject it on a default build.
+    let s = OutputSpec::single_file(vec![Rung::new(640, 360)]).with_color(ColorPolicy::Hdr10);
+    let caps = codec::encode::build_output_caps();
+    if caps.max_bit_depth < 10 {
+        assert!(s.validate().is_err(), "HDR must be rejected on an 8-bit-only build");
+    } else {
+        assert!(s.validate().is_ok());
+    }
+}
+
+#[test]
+fn validate_rejects_hdr_forced_8bit() {
+    let s = OutputSpec::single_file(vec![Rung::new(640, 360)])
+        .with_color(ColorPolicy::Hdr10)
+        .with_bit_depth(BitDepth::EightBit);
+    assert!(s.validate().is_err());
+}
+
+#[test]
+fn quality_crf_applies_to_encoder_config() {
+    let q = Quality::crf(28);
+    let mut cfg = EncoderConfig::default();
+    q.apply(&mut cfg, 30.0);
+    assert_eq!(cfg.quality, 28);
+    assert_eq!(cfg.keyframe_interval, 60); // 2 * 30
+}
