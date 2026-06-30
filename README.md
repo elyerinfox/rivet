@@ -176,7 +176,7 @@ or your own implementation.
 [dependencies]
 # Published as `rivet-transcoder` (the crate name `rivet` was taken); the lib is
 # `rivet`, so the rename keeps `use rivet::…` working as below.
-rivet = { package = "rivet-transcoder", version = "0.1" }
+rivet = { package = "rivet-transcoder", version = "0.2" }
 ```
 
 (Or `cargo add rivet-transcoder` and `use rivet_transcoder as rivet;`.)
