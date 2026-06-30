@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # libopus's vendored CMakeLists predates CMake 4's policy floor.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  test:
+    name: build + lib tests (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native build deps
+        # nasm: x86 asm for rav1d / openh264. cmake: builds libopus.
+        # gcc/g++/make ship on the runner already.
+        run: sudo apt-get update && sudo apt-get install -y nasm cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (workspace, default features)
+        run: cargo build --workspace --locked
+
+      - name: Lib tests
+        run: |
+          cargo test -p rivet-codec      --lib --features serde --locked
+          cargo test -p rivet-container  --lib --locked
+          cargo test -p rivet-transcoder --lib --features server,batch,ipc,thumbnail --locked
