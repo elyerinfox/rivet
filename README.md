@@ -3,7 +3,10 @@
 [![crates.io](https://img.shields.io/crates/v/rivet-transcoder.svg?logo=rust)](https://crates.io/crates/rivet-transcoder)
 [![Downloads](https://img.shields.io/crates/d/rivet-transcoder.svg)](https://crates.io/crates/rivet-transcoder)
 [![docs.rs](https://img.shields.io/docsrs/rivet-transcoder.svg?logo=docsdotrs)](https://docs.rs/rivet-transcoder)
+[![CI](https://github.com/rivet-transcoder/rivet/actions/workflows/ci.yml/badge.svg)](https://github.com/rivet-transcoder/rivet/actions/workflows/ci.yml)
+[![dependencies](https://deps.rs/repo/github/rivet-transcoder/rivet/status.svg)](https://deps.rs/repo/github/rivet-transcoder/rivet)
 [![License](https://img.shields.io/badge/license-source--available-orange.svg)](LICENSE.md)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-2b6cb0.svg)](#building)
 
 A modular, GPU-accelerated video transcoding **library** and **command-line
 tool**, written in Rust. Install the CLI with `cargo install rivet-transcoder`
@@ -682,6 +685,15 @@ etc. works on either). A default build has no hardware encoder; enable `nvidia`
 / `amd` / `qsv` (or `ffmpeg`) for your target silicon. **Decode** is in-tree for
 all three vendors too — NVDEC (`nvidia`), AMF (`amd`), and QSV (`qsv`), the same
 hand-rolled-FFI approach — with `ffmpeg` as the cross-vendor fallback.
+
+## Contributing
+
+rivet is **web-first and deliberately focused** — the web codecs (AV1 / H.264 /
+H.265) and containers (MP4 / CMAF·HLS) are in scope; niche/legacy formats and
+"everything FFmpeg does" are explicit **non-goals**. See
+**[CONTRIBUTING.md](CONTRIBUTING.md)** for the scope (in vs out), the dev setup,
+and what a good PR looks like. The filter question for any feature: *does this
+make video play better on the web, for real users?*
 
 ## License
 
